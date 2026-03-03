@@ -504,6 +504,24 @@ func TestRunMissingSeedStageUsesSentinel(t *testing.T) {
 	}
 }
 
+func TestRunMissingTriggerStageUsesSentinel(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	tr := testTrigger[int]{
+		name:  "bad-trigger",
+		stage: "missing",
+		fn: func(ctx context.Context, emit func(int) error) error {
+			return nil
+		},
+	}
+
+	_, err := p.Run(context.Background(), nil, WithTriggers[int](tr))
+	if !errors.Is(err, ErrStageNotFound) {
+		t.Fatalf("expected ErrStageNotFound, got %v", err)
+	}
+}
+
 func TestRunTriggerErrorFailFastCancels(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
