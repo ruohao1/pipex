@@ -1,8 +1,8 @@
 package pipex
 
 import (
-	"maps"
 	"context"
+	"maps"
 	"slices"
 	"sync"
 )
@@ -23,19 +23,19 @@ func NewPipeline[T any]() *Pipeline[T] {
 
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
 func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string][]T, error) {
-	// Validate the pipeline configuration before running
-	if err := p.Validate(); err != nil {
-		return nil, err
-	}
 	// Snapshot the pipeline configuration to avoid holding locks during execution
 	// This allows the pipeline to be modified concurrently while it's running, but it also means that changes made to the pipeline after this point will not affect the current execution.
 	p.mu.RLock()
-	defer p.mu.RUnlock()
 	stages := make(map[string]Stage[T], len(p.stages))
 	maps.Copy(stages, p.stages)
 	edges := make(map[string][]string, len(p.edges))
 	for k, v := range p.edges {
 		edges[k] = append([]string(nil), v...)
+	}
+	p.mu.RUnlock()
+	// Validate the pipeline configuration snapshot before starting execution. This ensures that we are working with a consistent view of the pipeline configuration and that any issues are caught early.
+	if err := p.validateSnapshot(stages, edges); err != nil {
+		return nil, err
 	}
 
 	// Validate that every seed stage exists in the pipeline
@@ -49,42 +49,112 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string
 		return nil, ctx.Err()
 	}
 
+	// workItem represents a unit of work to be processed by a stage. It contains the name of the stage and the value to be processed.
 	type workItem[T any] struct {
 		name  string
 		value T
 	}
-	results := make(map[string][]T)
-	queue := make([]workItem[T], 0, 128)
+	// workersWG is used to wait for all worker goroutines to finish processing. tasksWG is used to track the number of tasks that are currently being processed. This allows us to know when all tasks have been completed and we can safely return the results.
+	var workersWG sync.WaitGroup
+	var tasksWG sync.WaitGroup
 
+	// results will store the output items for each stage. It is protected by a mutex to allow concurrent access from multiple workers.
+	results := make(map[string][]T)
+	var resultsMu sync.Mutex
+
+	// queue is a slice that holds the initial work items to be processed. It is initialized with the seeds provided for each stage.
+	queue := make([]workItem[T], 0, 128)
 	for stageName, inputs := range seeds {
 		for _, input := range inputs {
+			tasksWG.Add(1) // Increment the task count for each seed item
 			queue = append(queue, workItem[T]{name: stageName, value: input})
 		}
 	}
 
-	for len(queue) > 0 {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		item := queue[0]
-		queue = queue[1:]
+	// inCh is a map of stage names to their corresponding input channels. Each stage will read from its input channel to receive work items to process.
+	inCh := make(map[string]chan T)
 
-		stage, ok := stages[item.name]
-		if !ok {
-			return nil, ErrStageNotFound(item.name)
+	// Create a cancellable context to allow workers to stop processing when an error occurs or when the context is canceled. This ensures that we can gracefully shut down the pipeline execution in case of errors or cancellation.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, 1)
+	var errOnce sync.Once
+	setFirstErr := func(err error) {
+		if err == nil {
+			return
 		}
-		outputs, err := stage.Process(ctx, item.value)
-		if err != nil {
-			return nil, err
-		}
-		results[item.name] = append(results[item.name], outputs...)
-		for _, nextStageName := range edges[item.name] {
-			for _, output := range outputs {
-				queue = append(queue, workItem[T]{name: nextStageName, value: output})
-			}
+		errOnce.Do(func() {
+			errs <- err
+			cancel()
+		})
+	}
+
+	// Initialize channels for each stage
+	for stageName, stage := range stages {
+		inCh[stageName] = make(chan T, 128) // Buffered channel to allow some queuing
+		for i := 0; i < stage.Workers(); i++ {
+			workersWG.Add(1)
+			go func(stageName string, stage Stage[T]) {
+				defer workersWG.Done()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case in, ok := <-inCh[stageName]:
+						if !ok {
+							return
+						}
+
+						outs, err := stage.Process(ctx, in)
+						if err != nil {
+							setFirstErr(err) // mutex/once + cancel()
+							tasksWG.Done()
+							continue
+						}
+
+						resultsMu.Lock()
+						results[stageName] = append(results[stageName], outs...)
+						resultsMu.Unlock()
+
+						for _, out := range outs {
+							for _, next := range edges[stageName] {
+								tasksWG.Add(1)
+								select {
+								case <-ctx.Done():
+									tasksWG.Done()
+								case inCh[next] <- out:
+								}
+							}
+						}
+
+						tasksWG.Done()
+					}
+				}
+			}(stageName, stage)
 		}
 	}
 
+	for len(queue) > 0 {
+		for _, item := range queue {
+			inCh[item.name] <- item.value
+		}
+		queue = queue[:0] // Clear the queue for the next iteration
+	}
+
+	// Start a goroutine to close all input channels once all tasks have been completed. This signals the workers that there are no more items to process and allows them to exit gracefully.
+	go func() {
+		tasksWG.Wait()
+		for _, ch := range inCh {
+			close(ch)
+		}
+	}()
+	workersWG.Wait() // Wait for all workers to finish processing
+
+	select {
+	case err := <-errs:
+		return nil, err // Return the error if any worker reported an error
+	default:
+	}
 	return results, nil
 }
 
@@ -138,18 +208,22 @@ func (p *Pipeline[T]) Validate() error {
 	// Lock the pipeline for reading to ensure thread safety when accessing the stages and edges maps.
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	return p.validateSnapshot(p.stages, p.edges)
+}
+
+func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string) error {
 	// Check that there is at least one stage
-	if len(p.stages) == 0 {
+	if len(stages) == 0 {
 		return ErrNoStages
 	}
 
 	// Check that all stages referenced in edges exist
-	for from, tos := range p.edges {
-		if _, ok := p.stages[from]; !ok {
+	for from, tos := range edges {
+		if _, ok := stages[from]; !ok {
 			return ErrStageNotFound(from)
 		}
 		for _, to := range tos {
-			if _, ok := p.stages[to]; !ok {
+			if _, ok := stages[to]; !ok {
 				return ErrStageNotFound(to)
 			}
 		}
@@ -171,7 +245,7 @@ func (p *Pipeline[T]) Validate() error {
 		visited[node] = true
 		recStack[node] = true
 
-		if slices.ContainsFunc(p.edges[node], dfs) {
+		if slices.ContainsFunc(edges[node], dfs) {
 			return true
 		}
 
@@ -179,7 +253,7 @@ func (p *Pipeline[T]) Validate() error {
 		return false
 	}
 
-	for stage := range p.stages {
+	for stage := range stages {
 		if !visited[stage] {
 			if dfs(stage) {
 				return ErrCycle
