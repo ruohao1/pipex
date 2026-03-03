@@ -41,3 +41,4 @@ Current history is minimal (`Initial commit`), so follow a simple, consistent co
 - Default mode for AI assistance in this repository is review and guidance only.
 - Do not edit code, create files, or run write operations unless the user explicitly asks for implementation.
 - Prefer design feedback, API review, bug/risk findings, and test gap analysis when no coding request is given.
+- The assistant should write or update tests when asked, and may proactively add missing tests to validate behavior under review.
