@@ -21,6 +21,10 @@ var (
 	ErrCycle      = errors.New("pipeline graph contains a cycle")
 
 	ErrNotEnoughStages = errors.New("not enough stages to connect")
+
+	ErrInvalidWorkerCount = errors.New("worker count must be greater than zero")
+	ErrInvalidQueueSize   = errors.New("queue size must be non-negative")
+	ErrNilJobFunc         = errors.New("job function cannot be nil")
 )
 
 func StageNotFound(name string) error {

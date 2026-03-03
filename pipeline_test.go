@@ -592,6 +592,58 @@ func TestRunTriggerErrorNoFailFastContinues(t *testing.T) {
 	}
 }
 
+func TestRunTriggerErrorReturnsPartialResultsWhenEnabled(t *testing.T) {
+	p := NewPipeline[int]()
+	var seen int64
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 2,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			atomic.AddInt64(&seen, 1)
+			return []int{in}, nil
+		},
+	})
+
+	wantErr := errors.New("trigger failed")
+	fail := testTrigger[int]{
+		name:  "fail",
+		stage: "a",
+		fn: func(ctx context.Context, emit func(int) error) error {
+			if err := emit(1); err != nil {
+				return err
+			}
+			return wantErr
+		},
+	}
+	ok := testTrigger[int]{
+		name:  "ok",
+		stage: "a",
+		fn: func(ctx context.Context, emit func(int) error) error {
+			return emit(2)
+		},
+	}
+
+	res, err := p.Run(
+		context.Background(),
+		nil,
+		WithFailFast[int](false),
+		WithPartialResults[int](true),
+		WithTriggers[int](fail, ok),
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected joined error to include %v, got %v", wantErr, err)
+	}
+	if res == nil {
+		t.Fatal("expected partial results map, got nil")
+	}
+	if got := len(res["a"]); got != 2 {
+		t.Fatalf("expected two partial results, got %d", got)
+	}
+	if got := atomic.LoadInt64(&seen); got != 2 {
+		t.Fatalf("expected both trigger emissions to be processed, got %d", got)
+	}
+}
+
 func TestRunSeedsAndTriggersMixedFlow(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 2})
