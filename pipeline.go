@@ -48,13 +48,13 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	// Validate that every seed stage exists in the pipeline
 	for seedStage := range seeds {
 		if _, ok := stages[seedStage]; !ok {
-			return nil, ErrStageNotFound(seedStage)
+			return nil, StageNotFound(seedStage)
 		}
 	}
 	// Validate that every stage exists in triggers
 	for _, trigger := range runOpts.Triggers {
 		if _, ok := stages[trigger.Stage()]; !ok {
-			return nil, fmt.Errorf("trigger %s: %w", trigger.Name(), ErrStageNotFound(trigger.Stage()))
+			return nil, fmt.Errorf("trigger %s: %w", trigger.Name(), StageNotFound(trigger.Stage()))
 		}
 	}
 
@@ -152,14 +152,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					// Send the output items to the next stages as defined by the edges. We also check for context cancellation before sending items to avoid unnecessary work if the execution has been canceled.
 					for _, out := range outs {
 						for _, next := range edges[stageName] {
- tasksWG.Add(1)
-  select {
-  case inCh[next] <- out:
-  	// queued successfully
-  case <-ctx.Done():
-  	// rollback task count because item was not enqueued
-  	tasksWG.Done()
-  }
+							tasksWG.Add(1)
+							select {
+							case inCh[next] <- out:
+								// queued successfully
+							case <-ctx.Done():
+								// rollback task count because item was not enqueued
+								tasksWG.Done()
+							}
 						}
 					}
 
@@ -208,7 +208,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	for _, item := range queue {
 		inCh[item.name] <- item.value
 	}
-	queue = queue[:0] // Clear the queue for the next iteration
 
 	// Start a goroutine to close all input channels once all tasks have been completed. This signals the workers that there are no more items to process and allows them to exit gracefully.
 	go func() {
@@ -224,14 +223,19 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	errsMu.Lock()
 	joinedErr := errors.Join(runErrs...)
 	errsMu.Unlock()
-	if joinedErr != nil {
-		return nil, joinedErr
-	}
+if joinedErr != nil {
+  	if runOpts.ReturnPartialResults {
+  		return results, joinedErr
+  	}
+  	return nil, joinedErr
+  }
 
-	// Check if the context was canceled before returning results. If it was, return the context error instead of the results. This ensures that we do not return partial results if the execution was canceled.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+  if err := ctx.Err(); err != nil {
+  	if runOpts.ReturnPartialResults {
+  		return results, err
+  	}
+  	return nil, err
+  }
 	return results, nil
 }
 
@@ -267,10 +271,10 @@ func (p *Pipeline[T]) Connect(from, to string) error {
 		return ErrCycle
 	}
 	if _, okFrom := p.stages[from]; !okFrom {
-		return ErrStageNotFound(from)
+		return StageNotFound(from)
 	}
 	if _, okTo := p.stages[to]; !okTo {
-		return ErrStageNotFound(to)
+		return StageNotFound(to)
 	}
 	if slices.Contains(p.edges[from], to) {
 		return fmt.Errorf("%w: %s -> %s", ErrEdgeExists, from, to)
@@ -297,11 +301,11 @@ func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[str
 	// Check that all stages referenced in edges exist
 	for from, tos := range edges {
 		if _, ok := stages[from]; !ok {
-			return ErrStageNotFound(from)
+			return StageNotFound(from)
 		}
 		for _, to := range tos {
 			if _, ok := stages[to]; !ok {
-				return ErrStageNotFound(to)
+				return StageNotFound(to)
 			}
 		}
 	}

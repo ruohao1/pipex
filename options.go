@@ -4,6 +4,7 @@ type RunOptions[T any] struct {
   	BufferSize int
   	FailFast   bool
   	Triggers   []Trigger[T]
+		ReturnPartialResults bool
   }
 
 type Option[T any] func(*RunOptions[T])
@@ -39,3 +40,8 @@ func WithTriggers[T any](triggers ...Trigger[T]) Option[T] {
 	}
 }
 
+func WithPartialResults[T any](v bool) Option[T] {
+  	return func(opts *RunOptions[T]) {
+  		opts.ReturnPartialResults = v
+  	}
+  }
