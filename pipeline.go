@@ -2,6 +2,8 @@ package pipex
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"sync"
@@ -22,7 +24,11 @@ func NewPipeline[T any]() *Pipeline[T] {
 }
 
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
-func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string][]T, error) {
+func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Option) (map[string][]T, error) {
+	runOpts := defaultOptions()
+	for _, opt := range opts {
+		opt(runOpts)
+	}
 	// Snapshot the pipeline configuration to avoid holding locks during execution
 	// This allows the pipeline to be modified concurrently while it's running, but it also means that changes made to the pipeline after this point will not affect the current execution.
 	p.mu.RLock()
@@ -63,7 +69,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string
 	var resultsMu sync.Mutex
 
 	// queue is a slice that holds the initial work items to be processed. It is initialized with the seeds provided for each stage.
-	queue := make([]workItem[T], 0, 128)
+	queue := make([]workItem[T], 0, runOpts.BufferSize)
 	for stageName, inputs := range seeds {
 		for _, input := range inputs {
 			tasksWG.Add(1) // Increment the task count for each seed item
@@ -77,22 +83,24 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string
 	// Create a cancellable context to allow workers to stop processing when an error occurs or when the context is canceled. This ensures that we can gracefully shut down the pipeline execution in case of errors or cancellation.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	errs := make(chan error, 1)
-	var errOnce sync.Once
-	setFirstErr := func(err error) {
+
+	var errsMu sync.Mutex
+	var runErrs []error
+
+	addErr := func(err error) {
 		if err == nil {
 			return
 		}
-		errOnce.Do(func() {
-			errs <- err
-			cancel()
-		})
+		errsMu.Lock()
+		runErrs = append(runErrs, err)
+		errsMu.Unlock()
 	}
+	var errOnce sync.Once
 
 	// Initialize channels for each stage
 	// Seperate from the main loop to avoid holding locks while creating channels and starting workers.
 	for stageName := range stages {
-		inCh[stageName] = make(chan T, 128)
+		inCh[stageName] = make(chan T, runOpts.BufferSize)
 	}
 
 	for stageName, stage := range stages {
@@ -112,7 +120,15 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string
 					// Process the input item using the stage's Process method. If an error occurs, we set the first error and stop processing further items.
 					outs, err := stage.Process(ctx, in)
 					if err != nil {
-						setFirstErr(err)
+						wrapped := fmt.Errorf("stage %s: %w", stageName, err)
+						if runOpts.FailFast {
+							errOnce.Do(func() {
+								addErr(wrapped)
+								cancel()
+							})
+						} else {
+							addErr(wrapped)
+						}
 						tasksWG.Done()
 						continue
 					}
@@ -156,16 +172,18 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string
 	}()
 	workersWG.Wait() // Wait for all workers to finish processing
 
-	select {
-	case err := <-errs:
-		return nil, err // Return the error if any worker reported an error
-	default:
-	}
 	// Check if the context was canceled during processing. If so, return the context error. This ensures that we handle cancellation properly and do not return results if the execution was canceled.
+	errsMu.Lock()
+	joinedErr := errors.Join(runErrs...)
+	errsMu.Unlock()
+	if joinedErr != nil {
+		return nil, joinedErr
+	}
+
+	// Check if the context was canceled before returning results. If it was, return the context error instead of the results. This ensures that we do not return partial results if the execution was canceled.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
 	return results, nil
 }
 
@@ -185,7 +203,7 @@ func (p *Pipeline[T]) AddStage(stage Stage[T]) error {
 		return ErrStageInvalidWorkerCount(stage.Name(), stage.Workers())
 	}
 	if _, exists := p.stages[stage.Name()]; exists {
-		return ErrStageExists(stage.Name())
+		return fmt.Errorf("%w: %s", ErrStageExists, stage.Name())
 	}
 
 	p.stages[stage.Name()] = stage
@@ -207,7 +225,7 @@ func (p *Pipeline[T]) Connect(from, to string) error {
 		return ErrStageNotFound(to)
 	}
 	if slices.Contains(p.edges[from], to) {
-		return ErrEdgeExists(from, to)
+		return fmt.Errorf("%w: %s -> %s", ErrEdgeExists, from, to)
 	}
 
 	p.edges[from] = append(p.edges[from], to)

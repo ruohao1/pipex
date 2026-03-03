@@ -3,6 +3,7 @@ package pipex
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -271,5 +272,135 @@ func TestRunContextCanceledMidRun(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+func TestRunFailFastReturnsStageError(t *testing.T) {
+	p := NewPipeline[int]()
+	wantErr := errors.New("boom")
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 4,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return nil, wantErr
+		},
+	})
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2, 3, 4, 5, 6}},
+		WithFailFast(true),
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected stage error %v, got %v", wantErr, err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("expected stage error precedence over context cancellation, got %v", err)
+	}
+}
+
+func TestRunNoFailFastContinuesAndReturnsJoinedError(t *testing.T) {
+	p := NewPipeline[int]()
+	var seen int64
+	wantErr := errors.New("odd input")
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 4,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			atomic.AddInt64(&seen, 1)
+			if in%2 == 1 {
+				return nil, wantErr
+			}
+			return []int{in}, nil
+		},
+	})
+
+	seeds := make([]int, 100)
+	for i := range 100 {
+		seeds[i] = i
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": seeds},
+		WithFailFast(false),
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected joined error to include %v, got %v", wantErr, err)
+	}
+	if got := atomic.LoadInt64(&seen); got != int64(len(seeds)) {
+		t.Fatalf("expected all inputs to be processed without fail-fast, got %d want %d", got, len(seeds))
+	}
+}
+
+func TestRunWithSmallBufferUnderLoad(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 4})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 4})
+	_ = p.Connect("a", "b")
+
+	const n = 1000
+	seeds := make([]int, n)
+	for i := range n {
+		seeds[i] = i
+	}
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": seeds},
+		WithBufferSize(1),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error with small buffer: %v", err)
+	}
+	if got := len(res["a"]); got != n {
+		t.Fatalf("unexpected stage a result count: got %d want %d", got, n)
+	}
+	if got := len(res["b"]); got != n {
+		t.Fatalf("unexpected stage b result count: got %d want %d", got, n)
+	}
+}
+
+func TestRunStageErrorWinsOverExternalCancellation(t *testing.T) {
+	p := NewPipeline[int]()
+	wantErr := errors.New("stage failed")
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil, wantErr
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(ctx, map[string][]int{"a": {1}}, WithFailFast(true))
+		done <- err
+	}()
+
+	select {
+	case <-started:
+		cancel()
+		close(release)
+	case <-time.After(2 * time.Second):
+		t.Fatal("stage did not start in time")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("expected stage error %v, got %v", wantErr, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after error/cancellation interplay")
 	}
 }
