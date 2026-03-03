@@ -90,45 +90,51 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string
 	}
 
 	// Initialize channels for each stage
+	// Seperate from the main loop to avoid holding locks while creating channels and starting workers.
+	for stageName := range stages {
+		inCh[stageName] = make(chan T, 128)
+	}
+
 	for stageName, stage := range stages {
-		inCh[stageName] = make(chan T, 128) // Buffered channel to allow some queuing
 		for i := 0; i < stage.Workers(); i++ {
+			// Each worker goroutine will read from the input channel of its assigned stage, process the items, and send the results to the next stages as defined by the edges. The worker will also handle errors and update the results map concurrently.
 			workersWG.Add(1)
 			go func(stageName string, stage Stage[T]) {
 				defer workersWG.Done()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case in, ok := <-inCh[stageName]:
-						if !ok {
-							return
-						}
 
-						outs, err := stage.Process(ctx, in)
-						if err != nil {
-							setFirstErr(err) // mutex/once + cancel()
-							tasksWG.Done()
-							continue
-						}
-
-						resultsMu.Lock()
-						results[stageName] = append(results[stageName], outs...)
-						resultsMu.Unlock()
-
-						for _, out := range outs {
-							for _, next := range edges[stageName] {
-								tasksWG.Add(1)
-								select {
-								case <-ctx.Done():
-									tasksWG.Done()
-								case inCh[next] <- out:
-								}
-							}
-						}
-
+				for in := range inCh[stageName] {
+					// Check if the context has been canceled before processing each item. If it has, we can skip processing and exit the worker gracefully.
+					if ctx.Err() != nil {
 						tasksWG.Done()
+						continue
 					}
+
+					// Process the input item using the stage's Process method. If an error occurs, we set the first error and stop processing further items.
+					outs, err := stage.Process(ctx, in)
+					if err != nil {
+						setFirstErr(err)
+						tasksWG.Done()
+						continue
+					}
+
+					// Update the results map with the output items from this stage. We lock the mutex to ensure that updates to the results map are thread-safe.
+					resultsMu.Lock()
+					results[stageName] = append(results[stageName], outs...)
+					resultsMu.Unlock()
+
+					// Send the output items to the next stages as defined by the edges. We also check for context cancellation before sending items to avoid unnecessary work if the execution has been canceled.
+					for _, out := range outs {
+						for _, next := range edges[stageName] {
+							tasksWG.Add(1)
+							if ctx.Err() != nil {
+								tasksWG.Done()
+								continue
+							}
+							inCh[next] <- out
+						}
+					}
+
+					tasksWG.Done()
 				}
 			}(stageName, stage)
 		}
@@ -155,6 +161,11 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T) (map[string
 		return nil, err // Return the error if any worker reported an error
 	default:
 	}
+	// Check if the context was canceled during processing. If so, return the context error. This ensures that we handle cancellation properly and do not return results if the execution was canceled.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	return results, nil
 }
 

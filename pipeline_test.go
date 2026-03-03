@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 type testStage[T any] struct {
@@ -227,5 +228,48 @@ func TestRunContextCanceled(t *testing.T) {
 	_, err := p.Run(ctx, map[string][]int{"a": {1}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context canceled, got %v", err)
+	}
+}
+
+func TestRunContextCanceledMidRun(t *testing.T) {
+	p := NewPipeline[int]()
+	started := make(chan struct{}, 1)
+
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(ctx, map[string][]int{"a": {1}})
+		done <- err
+	}()
+
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("stage did not start in time")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancellation")
 	}
 }
