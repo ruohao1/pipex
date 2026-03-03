@@ -25,6 +25,23 @@ func (s testStage[T]) Process(ctx context.Context, in T) (out []T, err error) {
 	return []T{in}, nil
 }
 
+type testTrigger[T any] struct {
+	name  string
+	stage string
+	fn    func(context.Context, func(T) error) error
+}
+
+func (t testTrigger[T]) Name() string { return t.name }
+
+func (t testTrigger[T]) Stage() string { return t.stage }
+
+func (t testTrigger[T]) Start(ctx context.Context, emit func(T) error) error {
+	if t.fn != nil {
+		return t.fn(ctx, emit)
+	}
+	return nil
+}
+
 func TestAddStage(t *testing.T) {
 	p := NewPipeline[int]()
 
@@ -289,7 +306,7 @@ func TestRunFailFastReturnsStageError(t *testing.T) {
 	_, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": {1, 2, 3, 4, 5, 6}},
-		WithFailFast(true),
+		WithFailFast[int](true),
 	)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected stage error %v, got %v", wantErr, err)
@@ -323,7 +340,7 @@ func TestRunNoFailFastContinuesAndReturnsJoinedError(t *testing.T) {
 	_, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": seeds},
-		WithFailFast(false),
+		WithFailFast[int](false),
 	)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected joined error to include %v, got %v", wantErr, err)
@@ -348,7 +365,7 @@ func TestRunWithSmallBufferUnderLoad(t *testing.T) {
 	res, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": seeds},
-		WithBufferSize(1),
+		WithBufferSize[int](1),
 	)
 	if err != nil {
 		t.Fatalf("unexpected run error with small buffer: %v", err)
@@ -383,7 +400,7 @@ func TestRunStageErrorWinsOverExternalCancellation(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := p.Run(ctx, map[string][]int{"a": {1}}, WithFailFast(true))
+		_, err := p.Run(ctx, map[string][]int{"a": {1}}, WithFailFast[int](true))
 		done <- err
 	}()
 
@@ -402,5 +419,73 @@ func TestRunStageErrorWinsOverExternalCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after error/cancellation interplay")
+	}
+}
+
+func TestRunTriggerEmitsAndCompletes(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 2,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in + 10}, nil
+		},
+	})
+
+	tr := testTrigger[int]{
+		name:  "finite",
+		stage: "a",
+		fn: func(ctx context.Context, emit func(int) error) error {
+			for _, v := range []int{1, 2, 3} {
+				if err := emit(v); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+
+	res, err := p.Run(
+		context.Background(),
+		nil,
+		WithTriggers[int](tr),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["a"]); got != 3 {
+		t.Fatalf("unexpected stage a result count: got %d want %d", got, 3)
+	}
+}
+
+func TestRunNonTerminatingTriggerExitsOnContextCancel(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	tr := testTrigger[int]{
+		name:  "infinite",
+		stage: "a",
+		fn: func(ctx context.Context, emit func(int) error) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(ctx, nil, WithTriggers[int](tr))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancellation")
 	}
 }

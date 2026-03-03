@@ -24,8 +24,9 @@ func NewPipeline[T any]() *Pipeline[T] {
 }
 
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
-func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Option) (map[string][]T, error) {
-	runOpts := defaultOptions()
+func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Option[T]) (map[string][]T, error) {
+	// Apply the provided options to configure the execution of the pipeline.
+	runOpts := defaultOptions[T]()
 	for _, opt := range opts {
 		opt(runOpts)
 	}
@@ -50,6 +51,13 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			return nil, ErrStageNotFound(seedStage)
 		}
 	}
+	// Validate that every stage exists in triggers
+	for _, trigger := range runOpts.Triggers {
+		if _, ok := stages[trigger.Stage()]; !ok {
+			return nil, fmt.Errorf("trigger %s: %w", trigger.Name(), ErrStageNotFound(trigger.Stage()))
+		}
+	}
+
 	// Check if the context is already canceled before starting the execution
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -104,9 +112,12 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	}
 
 	for stageName, stage := range stages {
+
 		for i := 0; i < stage.Workers(); i++ {
+
 			// Each worker goroutine will read from the input channel of its assigned stage, process the items, and send the results to the next stages as defined by the edges. The worker will also handle errors and update the results map concurrently.
 			workersWG.Add(1)
+
 			go func(stageName string, stage Stage[T]) {
 				defer workersWG.Done()
 
@@ -141,12 +152,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					// Send the output items to the next stages as defined by the edges. We also check for context cancellation before sending items to avoid unnecessary work if the execution has been canceled.
 					for _, out := range outs {
 						for _, next := range edges[stageName] {
-							tasksWG.Add(1)
-							if ctx.Err() != nil {
-								tasksWG.Done()
-								continue
-							}
-							inCh[next] <- out
+ tasksWG.Add(1)
+  select {
+  case inCh[next] <- out:
+  	// queued successfully
+  case <-ctx.Done():
+  	// rollback task count because item was not enqueued
+  	tasksWG.Done()
+  }
 						}
 					}
 
@@ -156,15 +169,50 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 	}
 
-	for len(queue) > 0 {
-		for _, item := range queue {
-			inCh[item.name] <- item.value
-		}
-		queue = queue[:0] // Clear the queue for the next iteration
+	var triggersWG sync.WaitGroup
+
+	for _, trigger := range runOpts.Triggers {
+		// Start each trigger in a separate goroutine. Each trigger will emit items to its assigned stage's input channel. We also handle errors from triggers and update the results map concurrently.
+		triggersWG.Add(1)
+
+		go func(trigger Trigger[T]) {
+			defer triggersWG.Done()
+
+			emit := func(item T) error {
+				tasksWG.Add(1)
+				select {
+				case inCh[trigger.Stage()] <- item:
+					return nil
+				// We check for context cancellation before emitting each item. If the context has been canceled, we can skip emitting and exit the trigger gracefully.
+				case <-ctx.Done():
+					tasksWG.Done()
+					return ctx.Err()
+				}
+			}
+
+			if err := trigger.Start(ctx, emit); err != nil {
+				wrapped := fmt.Errorf("trigger %s: %w", trigger.Name(), err)
+				if runOpts.FailFast {
+					errOnce.Do(func() {
+						addErr(wrapped)
+						cancel()
+					})
+				} else {
+					addErr(wrapped)
+
+				}
+			}
+		}(trigger)
 	}
+
+	for _, item := range queue {
+		inCh[item.name] <- item.value
+	}
+	queue = queue[:0] // Clear the queue for the next iteration
 
 	// Start a goroutine to close all input channels once all tasks have been completed. This signals the workers that there are no more items to process and allows them to exit gracefully.
 	go func() {
+		triggersWG.Wait()
 		tasksWG.Wait()
 		for _, ch := range inCh {
 			close(ch)

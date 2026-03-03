@@ -1,21 +1,22 @@
 package pipex
 
-type RunOptions struct {
-	BufferSize int 
-	FailFast bool
-}
+type RunOptions[T any] struct {
+  	BufferSize int
+  	FailFast   bool
+  	Triggers   []Trigger[T]
+  }
 
-type Option func(*RunOptions)
+type Option[T any] func(*RunOptions[T])
 
-func defaultOptions() *RunOptions {
-	return &RunOptions{
+func defaultOptions[T any]() *RunOptions[T] {
+	return &RunOptions[T]{
 		BufferSize: 1024,
 		FailFast:   false,
 	}
 }
 
-func WithBufferSize(size int) Option {
-	return func(opts *RunOptions) {
+func WithBufferSize[T any](size int) Option[T] {
+	return func(opts *RunOptions[T]) {
 		if size <= 0 {
 			return
 		}
@@ -23,10 +24,18 @@ func WithBufferSize(size int) Option {
 	}
 }
 
-func WithFailFast(failFast bool) Option {
-	return func(opts *RunOptions) {
+func WithFailFast[T any](failFast bool) Option[T] {
+	return func(opts *RunOptions[T]) {
 		opts.FailFast = failFast
 	}
 }
 
+func WithTriggers[T any](triggers ...Trigger[T]) Option[T] {
+	return func(opts *RunOptions[T]) {
+		if len(triggers) == 0 {
+			return
+		}
+		opts.Triggers = append(opts.Triggers, triggers...)
+	}
+}
 
