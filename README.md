@@ -115,3 +115,9 @@ func main() {
 	fmt.Println("sink outputs:", len(res["sink"]))
 }
 ```
+
+Run the example:
+
+```bash
+go run ./examples/quickstart
+```

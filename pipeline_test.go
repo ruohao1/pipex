@@ -3,6 +3,7 @@ package pipex
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,6 +39,23 @@ func (t testTrigger[T]) Stage() string { return t.stage }
 func (t testTrigger[T]) Start(ctx context.Context, emit func(T) error) error {
 	if t.fn != nil {
 		return t.fn(ctx, emit)
+	}
+	return nil
+}
+
+type testSink[T any] struct {
+	name  string
+	stage string
+	fn    func(context.Context, T) error
+}
+
+func (s testSink[T]) Name() string { return s.name }
+
+func (s testSink[T]) Stage() string { return s.stage }
+
+func (s testSink[T]) Consume(ctx context.Context, item T) error {
+	if s.fn != nil {
+		return s.fn(ctx, item)
 	}
 	return nil
 }
@@ -687,6 +705,82 @@ func TestRunSeedsAndTriggersMixedFlow(t *testing.T) {
 	}
 	if sum != 20 {
 		t.Fatalf("unexpected stage b sum: got %d want %d", sum, 20)
+	}
+}
+
+func TestRunSinkConsumesPerItem(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 2,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in + 1}, nil
+		},
+	})
+
+	var (
+		mu  sync.Mutex
+		got []int
+	)
+	sink := testSink[int]{
+		name:  "capture",
+		stage: "a",
+		fn: func(ctx context.Context, item int) error {
+			mu.Lock()
+			got = append(got, item)
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2, 3}},
+		WithSinks[int](sink),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("expected 3 sink items, got %d (%v)", len(got), got)
+	}
+}
+
+func TestRunSinkRetriesUntilSuccess(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in}, nil
+		},
+	})
+
+	var attempts atomic.Int64
+	sink := testSink[int]{
+		name:  "retry",
+		stage: "a",
+		fn: func(ctx context.Context, item int) error {
+			if attempts.Add(1) <= 2 {
+				return errors.New("transient sink error")
+			}
+			return nil
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {42}},
+		WithSinks[int](sink),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := attempts.Load(); got < 3 {
+		t.Fatalf("expected sink retries, attempts=%d", got)
 	}
 }
 

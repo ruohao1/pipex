@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"time"
 )
 
 type Pipeline[T any] struct {
@@ -25,13 +26,11 @@ func NewPipeline[T any]() *Pipeline[T] {
 
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
 func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Option[T]) (map[string][]T, error) {
-	// Apply the provided options to configure the execution of the pipeline.
 	runOpts := defaultOptions[T]()
 	for _, opt := range opts {
 		opt(runOpts)
 	}
-	// Snapshot the pipeline configuration to avoid holding locks during execution
-	// This allows the pipeline to be modified concurrently while it's running, but it also means that changes made to the pipeline after this point will not affect the current execution.
+
 	p.mu.RLock()
 	stages := make(map[string]Stage[T], len(p.stages))
 	maps.Copy(stages, p.stages)
@@ -40,60 +39,51 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		edges[k] = append([]string(nil), v...)
 	}
 	p.mu.RUnlock()
-	// Validate the pipeline configuration snapshot before starting execution. This ensures that we are working with a consistent view of the pipeline configuration and that any issues are caught early.
+
 	if err := p.validateSnapshot(stages, edges); err != nil {
 		return nil, err
 	}
 
-	// Validate that every seed stage exists in the pipeline
 	for seedStage := range seeds {
 		if _, ok := stages[seedStage]; !ok {
 			return nil, StageNotFound(seedStage)
 		}
 	}
-	// Validate that every stage exists in triggers
 	for _, trigger := range runOpts.Triggers {
 		if _, ok := stages[trigger.Stage()]; !ok {
 			return nil, fmt.Errorf("trigger %s: %w", trigger.Name(), StageNotFound(trigger.Stage()))
 		}
 	}
+	for _, sink := range runOpts.Sinks {
+		if _, ok := stages[sink.Stage()]; !ok {
+			return nil, fmt.Errorf("sink %s: %w", sink.Name(), StageNotFound(sink.Stage()))
+		}
+	}
 
-	// Check if the context is already canceled before starting the execution
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 
-	// workItem represents a unit of work to be processed by a stage. It contains the name of the stage and the value to be processed.
-	type workItem[T any] struct {
-		name  string
-		value T
-	}
-	// workersWG is used to wait for all worker goroutines to finish processing. tasksWG is used to track the number of tasks that are currently being processed. This allows us to know when all tasks have been completed and we can safely return the results.
-	var workersWG sync.WaitGroup
-	var tasksWG sync.WaitGroup
-
-	// results will store the output items for each stage. It is protected by a mutex to allow concurrent access from multiple workers.
 	results := make(map[string][]T)
 	var resultsMu sync.Mutex
+	var tasksWG sync.WaitGroup
+	var poolErrWG sync.WaitGroup
+	var triggersWG sync.WaitGroup
+	var sinksWG sync.WaitGroup
 
-	// queue is a slice that holds the initial work items to be processed. It is initialized with the seeds provided for each stage.
-	queue := make([]workItem[T], 0, runOpts.BufferSize)
-	for stageName, inputs := range seeds {
-		for _, input := range inputs {
-			tasksWG.Add(1) // Increment the task count for each seed item
-			queue = append(queue, workItem[T]{name: stageName, value: input})
-		}
-	}
-
-	// inCh is a map of stage names to their corresponding input channels. Each stage will read from its input channel to receive work items to process.
-	inCh := make(map[string]chan T)
-
-	// Create a cancellable context to allow workers to stop processing when an error occurs or when the context is canceled. This ensures that we can gracefully shut down the pipeline execution in case of errors or cancellation.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	jobsByStage := make(map[string]chan Job, len(stages))
+	sinksByStage := make(map[string][]chan T)
 
 	var errsMu sync.Mutex
 	var runErrs []error
+	var errOnce sync.Once
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	isContextErr := func(err error) bool {
+		return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	}
 
 	addErr := func(err error) {
 		if err == nil {
@@ -103,139 +93,191 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		runErrs = append(runErrs, err)
 		errsMu.Unlock()
 	}
-	var errOnce sync.Once
 
-	// Initialize channels for each stage
-	// Seperate from the main loop to avoid holding locks while creating channels and starting workers.
-	for stageName := range stages {
-		inCh[stageName] = make(chan T, runOpts.BufferSize)
+	recordErr := func(err error) {
+		if err == nil || isContextErr(err) {
+			return
+		}
+		if runOpts.FailFast {
+			errOnce.Do(func() {
+				addErr(err)
+				cancel()
+			})
+			return
+		}
+		addErr(err)
+	}
+
+	for _, sink := range runOpts.Sinks {
+		sinkCh := make(chan T, runOpts.BufferSize)
+		sinksByStage[sink.Stage()] = append(sinksByStage[sink.Stage()], sinkCh)
+
+		sinksWG.Add(1)
+		go func(sink Sink[T], sinkCh chan T) {
+			defer sinksWG.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item, ok := <-sinkCh:
+					if !ok {
+						return
+					}
+
+					for {
+						if err := sink.Consume(ctx, item); err == nil {
+							break
+						} else {
+							if ctx.Err() != nil {
+								recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
+								return
+							}
+							time.Sleep(10 * time.Millisecond)
+						}
+					}
+				}
+			}
+		}(sink, sinkCh)
 	}
 
 	for stageName, stage := range stages {
+		stageJobs := make(chan Job, runOpts.BufferSize)
+		jobsByStage[stageName] = stageJobs
 
-		for i := 0; i < stage.Workers(); i++ {
+		pool, err := NewPool(PoolConfig{
+			Workers: stage.Workers(),
+			Queue:   runOpts.BufferSize,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create worker pool for stage %s: %w", stageName, err)
+		}
 
-			// Each worker goroutine will read from the input channel of its assigned stage, process the items, and send the results to the next stages as defined by the edges. The worker will also handle errors and update the results map concurrently.
-			workersWG.Add(1)
+		poolErrWG.Add(1)
+		poolErrCh := pool.Run(ctx, stageJobs)
+		go func(poolErrCh <-chan error) {
+			defer poolErrWG.Done()
+			for err := range poolErrCh {
+				recordErr(err)
+			}
+		}(poolErrCh)
+	}
 
-			go func(stageName string, stage Stage[T]) {
-				defer workersWG.Done()
+	var enqueue func(stageName string, in T) error
+	enqueue = func(stageName string, in T) error {
+		stageJobs, ok := jobsByStage[stageName]
+		if !ok {
+			return StageNotFound(stageName)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 
-				for in := range inCh[stageName] {
-					// Check if the context has been canceled before processing each item. If it has, we can skip processing and exit the worker gracefully.
-					if ctx.Err() != nil {
-						tasksWG.Done()
-						continue
-					}
-
-					// Process the input item using the stage's Process method. If an error occurs, we set the first error and stop processing further items.
-					outs, err := stage.Process(ctx, in)
-					if err != nil {
-						wrapped := fmt.Errorf("stage %s: %w", stageName, err)
-						if runOpts.FailFast {
-							errOnce.Do(func() {
-								addErr(wrapped)
-								cancel()
-							})
-						} else {
-							addErr(wrapped)
-						}
-						tasksWG.Done()
-						continue
-					}
-
-					// Update the results map with the output items from this stage. We lock the mutex to ensure that updates to the results map are thread-safe.
-					resultsMu.Lock()
-					results[stageName] = append(results[stageName], outs...)
-					resultsMu.Unlock()
-
-					// Send the output items to the next stages as defined by the edges. We also check for context cancellation before sending items to avoid unnecessary work if the execution has been canceled.
-					for _, out := range outs {
-						for _, next := range edges[stageName] {
-							tasksWG.Add(1)
-							select {
-							case inCh[next] <- out:
-								// queued successfully
-							case <-ctx.Done():
-								// rollback task count because item was not enqueued
-								tasksWG.Done()
-							}
-						}
-					}
-
-					tasksWG.Done()
+		tasksWG.Add(1)
+		job := Job{
+			Name: fmt.Sprintf("%s_%v", stageName, in),
+			Run: func(ctx context.Context) error {
+				defer tasksWG.Done()
+				if ctx.Err() != nil {
+					return ctx.Err()
 				}
-			}(stageName, stage)
+
+				stage := stages[stageName]
+				out, err := stage.Process(ctx, in)
+				if err != nil {
+					return fmt.Errorf("stage %s: %w", stageName, err)
+				}
+
+				resultsMu.Lock()
+				results[stageName] = append(results[stageName], out...)
+				resultsMu.Unlock()
+
+				for _, item := range out {
+					for _, sinkCh := range sinksByStage[stageName] {
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case sinkCh <- item:
+						}
+					}
+				}
+
+				for _, nextStage := range edges[stageName] {
+					for _, item := range out {
+						if err := enqueue(nextStage, item); err != nil {
+							return fmt.Errorf("enqueue to %s: %w", nextStage, err)
+						}
+					}
+				}
+
+				return nil
+			},
+		}
+
+		select {
+		case <-ctx.Done():
+			tasksWG.Done()
+			return ctx.Err()
+		case stageJobs <- job:
+			return nil
 		}
 	}
 
-	var triggersWG sync.WaitGroup
+	for stageName, inputs := range seeds {
+		for _, input := range inputs {
+			if err := enqueue(stageName, input); err != nil {
+				recordErr(fmt.Errorf("enqueue seed %s: %w", stageName, err))
+			}
+		}
+	}
 
 	for _, trigger := range runOpts.Triggers {
-		// Start each trigger in a separate goroutine. Each trigger will emit items to its assigned stage's input channel. We also handle errors from triggers and update the results map concurrently.
 		triggersWG.Add(1)
-
 		go func(trigger Trigger[T]) {
 			defer triggersWG.Done()
-
 			emit := func(item T) error {
-				tasksWG.Add(1)
-				select {
-				case inCh[trigger.Stage()] <- item:
-					return nil
-				// We check for context cancellation before emitting each item. If the context has been canceled, we can skip emitting and exit the trigger gracefully.
-				case <-ctx.Done():
-					tasksWG.Done()
-					return ctx.Err()
+				if err := enqueue(trigger.Stage(), item); err != nil {
+					return fmt.Errorf("trigger enqueue %s: %w", trigger.Name(), err)
 				}
+				return nil
 			}
-
 			if err := trigger.Start(ctx, emit); err != nil {
-				wrapped := fmt.Errorf("trigger %s: %w", trigger.Name(), err)
-				if runOpts.FailFast {
-					errOnce.Do(func() {
-						addErr(wrapped)
-						cancel()
-					})
-				} else {
-					addErr(wrapped)
-
-				}
+				recordErr(fmt.Errorf("trigger %s: %w", trigger.Name(), err))
 			}
 		}(trigger)
 	}
 
-	for _, item := range queue {
-		inCh[item.name] <- item.value
-	}
-
-	// Start a goroutine to close all input channels once all tasks have been completed. This signals the workers that there are no more items to process and allows them to exit gracefully.
-	go func() {
-		triggersWG.Wait()
+	triggersWG.Wait()
+	if ctx.Err() == nil {
 		tasksWG.Wait()
-		for _, ch := range inCh {
-			close(ch)
+	}
+	for _, jobsCh := range jobsByStage {
+		close(jobsCh)
+	}
+	poolErrWG.Wait()
+	for _, sinkChs := range sinksByStage {
+		for _, sinkCh := range sinkChs {
+			close(sinkCh)
 		}
-	}()
-	workersWG.Wait() // Wait for all workers to finish processing
+	}
+	sinksWG.Wait()
 
-	// Check if the context was canceled during processing. If so, return the context error. This ensures that we handle cancellation properly and do not return results if the execution was canceled.
 	errsMu.Lock()
 	joinedErr := errors.Join(runErrs...)
 	errsMu.Unlock()
-if joinedErr != nil {
-  	if runOpts.ReturnPartialResults {
-  		return results, joinedErr
-  	}
-  	return nil, joinedErr
-  }
+	if joinedErr != nil {
+		if runOpts.ReturnPartialResults {
+			return results, joinedErr
+		}
+		return nil, joinedErr
+	}
 
-  if err := ctx.Err(); err != nil {
-  	if runOpts.ReturnPartialResults {
-  		return results, err
-  	}
-  	return nil, err
-  }
+	if err := ctx.Err(); err != nil {
+		if runOpts.ReturnPartialResults {
+			return results, err
+		}
+		return nil, err
+	}
+
 	return results, nil
 }
 

@@ -1,11 +1,13 @@
 package pipex
 
 type RunOptions[T any] struct {
-  	BufferSize int
-  	FailFast   bool
-  	Triggers   []Trigger[T]
-		ReturnPartialResults bool
-  }
+	BufferSize           int
+	FailFast             bool
+	Triggers             []Trigger[T]
+	Sinks                []Sink[T]
+	ReturnPartialResults bool
+	Workers              int
+}
 
 type Option[T any] func(*RunOptions[T])
 
@@ -13,6 +15,8 @@ func defaultOptions[T any]() *RunOptions[T] {
 	return &RunOptions[T]{
 		BufferSize: 1024,
 		FailFast:   false,
+		Triggers:   []Trigger[T]{},
+		Workers:    1,
 	}
 }
 
@@ -40,8 +44,26 @@ func WithTriggers[T any](triggers ...Trigger[T]) Option[T] {
 	}
 }
 
+func WithSinks[T any](sinks ...Sink[T]) Option[T] {
+	return func(opts *RunOptions[T]) {
+		if len(sinks) == 0 {
+			return
+		}
+		opts.Sinks = append(opts.Sinks, sinks...)
+	}
+}
+
 func WithPartialResults[T any](v bool) Option[T] {
-  	return func(opts *RunOptions[T]) {
-  		opts.ReturnPartialResults = v
-  	}
-  }
+	return func(opts *RunOptions[T]) {
+		opts.ReturnPartialResults = v
+	}
+}
+
+func WithWorkers[T any](workers int) Option[T] {
+	return func(opts *RunOptions[T]) {
+		if workers <= 0 {
+			return
+		}
+		opts.Workers = workers
+	}
+}

@@ -40,6 +40,15 @@ func (p *Pool) Run(ctx context.Context, jobs <-chan Job) <-chan error {
 						return
 					}
 					if err := job.Exec(ctx); err != nil {
+						// If context is already canceled, prefer best-effort reporting of
+						// the current job error before worker exit.
+						if ctx.Err() != nil {
+							select {
+							case errs <- err:
+							default:
+							}
+							return
+						}
 						select {
 						case errs <- err:
 						case <-ctx.Done():
