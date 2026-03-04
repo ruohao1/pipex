@@ -80,6 +80,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	runCtx := ctx
 
 	isContextErr := func(err error) bool {
 		return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
@@ -115,6 +116,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		sinksWG.Add(1)
 		go func(sink Sink[T], sinkCh chan T) {
 			defer sinksWG.Done()
+			disabled := false
 			for {
 				select {
 				case <-ctx.Done():
@@ -123,16 +125,33 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					if !ok {
 						return
 					}
+					if disabled {
+						continue
+					}
 
+					attempts := 0
 					for {
-						if err := sink.Consume(ctx, item); err == nil {
+						err := sink.Consume(ctx, item)
+						if err == nil {
 							break
-						} else {
-							if ctx.Err() != nil {
-								recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
-								return
-							}
-							time.Sleep(10 * time.Millisecond)
+						}
+						attempts++
+
+						if runOpts.SinkRetry.MaxRetries >= 0 && attempts > runOpts.SinkRetry.MaxRetries {
+							recordErr(fmt.Errorf("sink %s: retries exhausted: %w", sink.Name(), err))
+							disabled = true
+							break
+						}
+
+						if ctx.Err() != nil {
+							recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
+							return
+						}
+
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(runOpts.SinkRetry.Backoff):
 						}
 					}
 				}
@@ -153,7 +172,9 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 
 		poolErrWG.Add(1)
-		poolErrCh := pool.Run(ctx, stageJobs)
+		// Keep stage workers alive until stage queues are closed so queued jobs
+		// can still call tasksWG.Done() even after run context cancellation.
+		poolErrCh := pool.Run(context.Background(), stageJobs)
 		go func(poolErrCh <-chan error) {
 			defer poolErrWG.Done()
 			for err := range poolErrCh {
@@ -175,14 +196,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		tasksWG.Add(1)
 		job := Job{
 			Name: fmt.Sprintf("%s_%v", stageName, in),
-			Run: func(ctx context.Context) error {
+			Run: func(_ context.Context) error {
 				defer tasksWG.Done()
-				if ctx.Err() != nil {
-					return ctx.Err()
+				if runCtx.Err() != nil {
+					return runCtx.Err()
 				}
 
 				stage := stages[stageName]
-				out, err := stage.Process(ctx, in)
+				out, err := stage.Process(runCtx, in)
 				if err != nil {
 					return fmt.Errorf("stage %s: %w", stageName, err)
 				}
@@ -194,8 +215,8 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				for _, item := range out {
 					for _, sinkCh := range sinksByStage[stageName] {
 						select {
-						case <-ctx.Done():
-							return ctx.Err()
+						case <-runCtx.Done():
+							return runCtx.Err()
 						case sinkCh <- item:
 						}
 					}
@@ -247,9 +268,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	}
 
 	triggersWG.Wait()
-	if ctx.Err() == nil {
-		tasksWG.Wait()
-	}
+	tasksWG.Wait()
 	for _, jobsCh := range jobsByStage {
 		close(jobsCh)
 	}

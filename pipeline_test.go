@@ -3,6 +3,7 @@ package pipex
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -781,6 +782,71 @@ func TestRunSinkRetriesUntilSuccess(t *testing.T) {
 	}
 	if got := attempts.Load(); got < 3 {
 		t.Fatalf("expected sink retries, attempts=%d", got)
+	}
+}
+
+func TestRunSinkRetryExhaustedReturnsError(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	sink := testSink[int]{
+		name:  "always-fail",
+		stage: "a",
+		fn: func(ctx context.Context, item int) error {
+			return errors.New("sink down")
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2, 3}},
+		WithSinks[int](sink),
+		WithSinkRetry[int](1, time.Millisecond),
+	)
+	if err == nil {
+		t.Fatal("expected sink retry exhaustion error")
+	}
+	if got := err.Error(); !strings.Contains(got, "retries exhausted") || !strings.Contains(got, "sink down") {
+		t.Fatalf("expected retries exhausted sink error, got %v", err)
+	}
+}
+
+func TestRunSinkRetryExhaustedFailFastCancels(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 4,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			time.Sleep(2 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+
+	sink := testSink[int]{
+		name:  "always-fail",
+		stage: "a",
+		fn: func(ctx context.Context, item int) error {
+			return errors.New("sink fail")
+		},
+	}
+
+	seeds := make([]int, 100)
+	for i := range seeds {
+		seeds[i] = i
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": seeds},
+		WithSinks[int](sink),
+		WithSinkRetry[int](0, time.Millisecond),
+		WithFailFast[int](true),
+	)
+	if err == nil {
+		t.Fatal("expected sink failure under fail-fast")
+	}
+	if got := err.Error(); !strings.Contains(got, "retries exhausted") || !strings.Contains(got, "sink fail") {
+		t.Fatalf("expected sink retry exhaustion error, got %v", err)
 	}
 }
 
