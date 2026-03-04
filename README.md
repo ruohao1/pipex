@@ -46,6 +46,15 @@ Defaults:
   - pipeline processing continues unless `WithFailFast(true)` is enabled.
 - On cancellation, sink workers stop via `ctx.Done()`.
 
+## Retry Policy Guide
+
+- Use bounded retries for most sinks:
+  - `WithSinkRetry(3..20, 10ms..250ms)` is a good starting range.
+  - This avoids permanently stuck runs when a downstream dependency is unhealthy.
+- Use `MaxRetries=-1` only for must-deliver workloads where the run is allowed to wait indefinitely.
+- Keep backoff non-zero to avoid tight retry loops and unnecessary CPU churn.
+- Use `WithFailFast(true)` when sink failures should abort the whole run quickly.
+
 ## Common Pitfalls
 
 - Non-terminating triggers will keep `Run` alive. Always provide a cancellable context for long-lived triggers.

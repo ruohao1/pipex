@@ -850,6 +850,66 @@ func TestRunSinkRetryExhaustedFailFastCancels(t *testing.T) {
 	}
 }
 
+func TestRunSlowSinkHighThroughputNoDeadlock(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 8,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in}, nil
+		},
+	})
+
+	const n = 500
+	seeds := make([]int, n)
+	for i := range seeds {
+		seeds[i] = i
+	}
+
+	var seen atomic.Int64
+	sink := testSink[int]{
+		name:  "slow",
+		stage: "a",
+		fn: func(ctx context.Context, item int) error {
+			time.Sleep(1 * time.Millisecond)
+			seen.Add(1)
+			return nil
+		},
+	}
+
+	done := make(chan struct {
+		res map[string][]int
+		err error
+	}, 1)
+	go func() {
+		res, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": seeds},
+			WithSinks[int](sink),
+			WithBufferSize[int](32),
+		)
+		done <- struct {
+			res map[string][]int
+			err error
+		}{res: res, err: err}
+	}()
+
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("unexpected run error: %v", out.err)
+		}
+		if got := len(out.res["a"]); got != n {
+			t.Fatalf("unexpected stage output count: got %d want %d", got, n)
+		}
+		if got := seen.Load(); got != int64(n) {
+			t.Fatalf("unexpected sink item count: got %d want %d", got, n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run appears deadlocked under slow sink load")
+	}
+}
+
 func TestRunPartialResultsOnStageError(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{
