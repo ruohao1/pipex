@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ruohao1/pipex/internal/graph"
 	"maps"
 	"slices"
 	"sync"
@@ -354,54 +355,27 @@ func (p *Pipeline[T]) Validate() error {
 }
 
 func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string) error {
-	// Check that there is at least one stage
-	if len(stages) == 0 {
-		return ErrNoStages
+	stageNames := make(map[string]struct{}, len(stages))
+	for name := range stages {
+		stageNames[name] = struct{}{}
 	}
 
-	// Check that all stages referenced in edges exist
-	for from, tos := range edges {
-		if _, ok := stages[from]; !ok {
-			return StageNotFound(from)
-		}
-		for _, to := range tos {
-			if _, ok := stages[to]; !ok {
-				return StageNotFound(to)
-			}
-		}
+	err := graph.ValidateSnapshot(stageNames, edges)
+	if err == nil {
+		return nil
 	}
 
-	// Check for cycles using depth-first search
-	visited := make(map[string]bool)
-	recStack := make(map[string]bool)
-
-	var dfs func(string) bool
-	dfs = func(node string) bool {
-		if recStack[node] {
-			return true // cycle detected
-		}
-		if visited[node] {
-			return false // already visited, no cycle from this node
-		}
-
-		visited[node] = true
-		recStack[node] = true
-
-		if slices.ContainsFunc(edges[node], dfs) {
-			return true
-		}
-
-		recStack[node] = false
-		return false
-	}
-
-	for stage := range stages {
-		if !visited[stage] {
-			if dfs(stage) {
-				return ErrCycle
-			}
+	var vErr *graph.ValidationError
+	if errors.As(err, &vErr) {
+		switch vErr.Kind {
+		case graph.ValidationNoStages:
+			return ErrNoStages
+		case graph.ValidationStageNotFound:
+			return StageNotFound(vErr.Stage)
+		case graph.ValidationCycle:
+			return ErrCycle
 		}
 	}
 
-	return nil
+	return err
 }
