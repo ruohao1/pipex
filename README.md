@@ -8,17 +8,22 @@ A library to help you create pipelines in Golang
 - `WithBufferSize(n)`: per-stage channel buffer size (`n > 0`).
 - `WithFailFast(v)`: when `true`, cancel execution on first stage error.
 - `WithTriggers(...)`: register trigger sources that emit items during runtime.
+- `WithSinks(...)`: register sinks that consume stage outputs per item during runtime.
+- `WithSinkRetry(maxRetries, backoff)`: configure sink retry policy.
 - `WithPartialResults(v)`: when `true`, return currently collected results together with an error.
 
 Defaults:
 
 - `BufferSize`: `1024`
 - `FailFast`: `false`
+- `SinkRetry.MaxRetries`: `10`
+- `SinkRetry.Backoff`: `10ms`
 
 ## Error Behavior
 
 - Pipeline config/graph validation errors are returned before execution starts.
 - If stage processing errors occur, `Run` returns a joined error (`errors.Join(...)`).
+- Trigger and sink errors are also joined into the returned error.
 - When `FailFast=true`, the first stage error cancels the run, and the stage error is returned (not `context.Canceled`).
 - If there are no stage errors but the context is canceled or times out, `Run` returns the context error.
 - By default, errors return `nil` results.
@@ -30,94 +35,68 @@ Defaults:
 - `Run` waits for all triggers to return from `Start(...)` before it can fully drain and close the pipeline.
 - A non-terminating trigger keeps `Run` alive until context cancellation.
 
+## Sink Lifecycle
+
+- Sinks consume items from one configured stage (`Sink.Stage()`).
+- Delivery is per output item (`Consume(ctx, item)`), not batch-based.
+- On sink failure, the same item is retried with `WithSinkRetry(maxRetries, backoff)`.
+- If retries are exhausted:
+  - the sink error is recorded,
+  - that sink is disabled for the remainder of the run,
+  - pipeline processing continues unless `WithFailFast(true)` is enabled.
+- On cancellation, sink workers stop via `ctx.Done()`.
+
 ## Common Pitfalls
 
 - Non-terminating triggers will keep `Run` alive. Always provide a cancellable context for long-lived triggers.
+- Sinks with persistent failures will eventually disable themselves after retry exhaustion unless `MaxRetries=-1`.
+- Using `MaxRetries=-1` means infinite retry and can keep a run alive if the sink never succeeds.
 - If you need progress on failure/cancellation, enable `WithPartialResults(true)`.
 
 ## Quickstart
 
 ```go
-package main
+p := pipex.NewPipeline[int]()
+_ = p.AddStage(srcStage)
+_ = p.AddStage(outStage)
+_ = p.Connect("src", "out")
 
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/ruohao1/pipex"
+res, err := p.Run(
+	context.Background(),
+	map[string][]int{"src": {1, 2, 3}},
+	pipex.WithBufferSize[int](64),
+	pipex.WithFailFast[int](true),
 )
-
-type stageFn[T any] struct {
-	name    string
-	workers int
-	fn      func(context.Context, T) ([]T, error)
-}
-
-func (s stageFn[T]) Name() string { return s.name }
-func (s stageFn[T]) Workers() int { return s.workers }
-func (s stageFn[T]) Process(ctx context.Context, in T) ([]T, error) {
-	return s.fn(ctx, in)
-}
-
-func main() {
-	p := pipex.NewPipeline[int]()
-
-	src := stageFn[int]{
-		name:    "src",
-		workers: 2,
-		fn: func(ctx context.Context, in int) ([]int, error) {
-			return []int{in + 1}, nil
-		},
-	}
-	sink := stageFn[int]{
-		name:    "sink",
-		workers: 2,
-		fn: func(ctx context.Context, in int) ([]int, error) {
-			return []int{in * 2}, nil
-		},
-	}
-
-	_ = p.AddStage(src)
-	_ = p.AddStage(sink)
-	_ = p.Connect("src", "sink")
-
-	tr := pipex.NewTrigger(
-		"ticker",
-		"src",
-		pipex.TriggerFunc[int](func(ctx context.Context, emit func(int) error) error {
-			for _, v := range []int{10, 20, 30} {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(50 * time.Millisecond):
-					if err := emit(v); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		}),
-	)
-
-	res, err := p.Run(
-		context.Background(),
-		map[string][]int{"src": {1, 2}}, // batch seeds
-		pipex.WithBufferSize[int](64),
-		pipex.WithFailFast[int](true),
-		pipex.WithTriggers[int](tr), // streaming source
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println("src outputs:", len(res["src"]))
-	fmt.Println("sink outputs:", len(res["sink"]))
-}
 ```
 
-Run the example:
+Full runnable example:
 
 ```bash
 go run ./examples/quickstart
+```
+
+## Sink Snippet
+
+```go
+type collectSink struct{ /* fields */ }
+func (s *collectSink) Name() string  { return "collector" }
+func (s *collectSink) Stage() string { return "out" }
+func (s *collectSink) Consume(ctx context.Context, item int) error {
+	// write to DB, queue, metrics, etc.
+	return nil
+}
+
+sink := &collectSink{}
+_, err := p.Run(
+	context.Background(),
+	map[string][]int{"src": {1, 2, 3}},
+	pipex.WithSinks[int](sink),
+	pipex.WithSinkRetry[int](10, 10*time.Millisecond),
+)
+```
+
+Full runnable sink example:
+
+```bash
+go run ./examples/sink
 ```
