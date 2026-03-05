@@ -4,28 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	iruntime "github.com/ruohao1/pipex/internal/runtime"
 	"maps"
 	"slices"
 	"sync"
 	"time"
 
-	"crypto/rand"
-	"encoding/hex"
 	"github.com/ruohao1/pipex/internal/graph"
-	"sync/atomic"
 )
-
-var runSeq uint64
-
-func newRunID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err == nil {
-		return hex.EncodeToString(b[:])
-	}
-	// Fallback if crypto RNG fails
-	n := atomic.AddUint64(&runSeq, 1)
-	return fmt.Sprintf("run-%d-%d", time.Now().UnixNano(), n)
-}
 
 type Pipeline[T any] struct {
 	stages map[string]Stage[T]
@@ -47,7 +33,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	for _, opt := range opts {
 		opt(runOpts)
 	}
-	runID := newRunID()
+	runID := iruntime.NewRunID()
 
 	p.mu.RLock()
 	stages := make(map[string]Stage[T], len(p.stages))
@@ -81,10 +67,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		FailFast:     runOpts.FailFast,
 		BufferSize:   runOpts.BufferSize,
 	}
-	emitRunStart(ctx, runOpts.Hooks, runMeta)
+	iruntime.Call2(runOpts.Hooks.RunStart, ctx, runMeta)
 	var retErr error
 	defer func() {
-		emitRunEnd(ctx, runOpts.Hooks, runMeta, retErr)
+		iruntime.Call3(runOpts.Hooks.RunEnd, ctx, runMeta, retErr)
 	}()
 
 	if err := p.validateSnapshot(stages, edges); err != nil {
@@ -184,7 +170,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					attempts := 0
 					for {
 						startTime := time.Now()
-						emitSinkConsumeStart(runCtx, runOpts.Hooks, SinkConsumeStartEvent[T]{
+						iruntime.Call2(runOpts.Hooks.SinkConsumeStart, runCtx, SinkConsumeStartEvent[T]{
 							RunID:     runID,
 							Sink:      sink.Name(),
 							Stage:     sink.Stage(),
@@ -197,7 +183,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 						duration := finishTime.Sub(startTime)
 
 						if err == nil {
-							emitSinkConsumeSuccess(runCtx, runOpts.Hooks, SinkConsumeSuccessEvent[T]{
+							iruntime.Call2(runOpts.Hooks.SinkConsumeSuccess, runCtx, SinkConsumeSuccessEvent[T]{
 								RunID:      runID,
 								Sink:       sink.Name(),
 								Stage:      sink.Stage(),
@@ -212,7 +198,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 						attempts++
 
 						if runOpts.SinkRetry.MaxRetries >= 0 && attempts > runOpts.SinkRetry.MaxRetries {
-							emitSinkExhausted(runCtx, runOpts.Hooks, SinkExhaustedEvent[T]{
+							iruntime.Call2(runOpts.Hooks.SinkExhausted, runCtx, SinkExhaustedEvent[T]{
 								RunID:    runID,
 								Sink:     sink.Name(),
 								Stage:    sink.Stage(),
@@ -231,7 +217,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 							return
 						}
 
-						emitSinkRetry(runCtx, runOpts.Hooks, SinkRetryEvent[T]{
+						iruntime.Call2(runOpts.Hooks.SinkRetry, runCtx, SinkRetryEvent[T]{
 							RunID:   runID,
 							Sink:    sink.Name(),
 							Stage:   sink.Stage(),
@@ -299,7 +285,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 				stage := stages[stageName]
 				startTime := time.Now()
-				emitStageStart(runCtx, runOpts.Hooks, StageStartEvent[T]{
+				iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
 					RunID:     runID,
 					Stage:     stageName,
 					Input:     in,
@@ -309,7 +295,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				finishTime := time.Now()
 				duration := finishTime.Sub(startTime)
 				if err != nil {
-					emitStageError(runCtx, runOpts.Hooks, StageErrorEvent[T]{
+					iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
 						RunID:      runID,
 						Stage:      stageName,
 						Input:      in,
@@ -320,7 +306,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					})
 					return fmt.Errorf("stage %s: %w", stageName, err)
 				}
-				emitStageFinish(runCtx, runOpts.Hooks, StageFinishEvent[T]{
+				iruntime.Call2(runOpts.Hooks.StageFinish, runCtx, StageFinishEvent[T]{
 					RunID:      runID,
 					Stage:      stageName,
 					Input:      in,
@@ -384,7 +370,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				return nil
 			}
 			startTime := time.Now()
-			emitTriggerStart(runCtx, runOpts.Hooks, TriggerStartEvent[T]{
+			iruntime.Call2(runOpts.Hooks.TriggerStart, runCtx, TriggerStartEvent[T]{
 				RunID:     runID,
 				Trigger:   trigger.Name(),
 				Stage:     trigger.Stage(),
@@ -394,7 +380,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			finishTime := time.Now()
 			duration := finishTime.Sub(startTime)
 			if err != nil {
-				emitTriggerError(runCtx, runOpts.Hooks, TriggerErrorEvent[T]{
+				iruntime.Call2(runOpts.Hooks.TriggerError, runCtx, TriggerErrorEvent[T]{
 					RunID:      runID,
 					Trigger:    trigger.Name(),
 					Stage:      trigger.Stage(),
@@ -406,7 +392,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				recordErr(fmt.Errorf("trigger %s: %w", trigger.Name(), err))
 				return
 			}
-			emitTriggerEnd(runCtx, runOpts.Hooks, TriggerEndEvent[T]{
+			iruntime.Call2(runOpts.Hooks.TriggerEnd, runCtx, TriggerEndEvent[T]{
 				RunID:      runID,
 				Trigger:    trigger.Name(),
 				Stage:      trigger.Stage(),
@@ -512,22 +498,11 @@ func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[str
 		stageNames[name] = struct{}{}
 	}
 
-	err := graph.ValidateSnapshot(stageNames, edges)
-	if err == nil {
-		return nil
-	}
-
-	var vErr *graph.ValidationError
-	if errors.As(err, &vErr) {
-		switch vErr.Kind {
-		case graph.ValidationNoStages:
-			return ErrNoStages
-		case graph.ValidationStageNotFound:
-			return StageNotFound(vErr.Stage)
-		case graph.ValidationCycle:
-			return ErrCycle
-		}
-	}
-
-	return err
+	return graph.ValidateSnapshotMapped(
+		stageNames,
+		edges,
+		func() error { return ErrNoStages },
+		StageNotFound,
+		func() error { return ErrCycle },
+	)
 }
