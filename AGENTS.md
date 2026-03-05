@@ -4,7 +4,13 @@
 This repository is a Go library for building reusable pipelines: `github.com/ruohao1/pipex`.
 Root files include `go.mod` (module path and Go version) and `README.md` (high-level description).
 
-As the library grows, keep production code in package-oriented `.go` files at the module root or in clearly named subpackages (for example, `pipeline/`, `stages/`). Keep tests next to source files using `_test.go`.
+Production code currently lives at the module root (`pipeline.go`, `compose.go`, `pool.go`, etc.). Keep tests next to source files using `_test.go`.
+
+`examples/` contains runnable programs:
+- `examples/quickstart`
+- `examples/sink`
+
+`internal/` is currently minimal and reserved for non-public runtime pieces once they are stabilized (for example, frontier scheduler/dedup utilities).
 
 ## Build, Test, and Development Commands
 Use standard Go tooling from the repository root:
@@ -42,3 +48,8 @@ Current history is minimal (`Initial commit`), so follow a simple, consistent co
 - Do not edit code, create files, or run write operations unless the user explicitly asks for implementation.
 - Prefer design feedback, API review, bug/risk findings, and test gap analysis when no coding request is given.
 - The assistant should write or update tests when asked, and may proactively add missing tests to validate behavior under review.
+
+## Current Product Notes
+- Pipeline execution uses per-stage worker pools.
+- Sinks consume per-item outputs (`Consume(ctx, item)`), with retry controls via `WithSinkRetry`.
+- Graph validation is DAG-only by default (no cycles).

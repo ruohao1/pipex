@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/ruohao1/pipex"
@@ -22,6 +23,7 @@ func (s stageFn[T]) Process(ctx context.Context, in T) ([]T, error) {
 
 func main() {
 	p := pipex.NewPipeline[int]()
+	var stageFinishCount atomic.Int64
 
 	src := stageFn[int]{
 		name:    "src",
@@ -66,12 +68,25 @@ func main() {
 		}),
 	)
 
+	hooks := pipex.Hooks[int]{
+		RunStart: func(ctx context.Context, meta pipex.RunMeta) {
+			fmt.Println("run start:", meta.RunID)
+		},
+		RunEnd: func(ctx context.Context, meta pipex.RunMeta, err error) {
+			fmt.Println("run end:", meta.RunID, "err:", err)
+		},
+		StageFinish: func(ctx context.Context, e pipex.StageFinishEvent[int]) {
+			stageFinishCount.Add(1)
+		},
+	}
+
 	res, err := p.Run(
 		context.Background(),
 		map[string][]int{"src": {1, 2}},
 		pipex.WithBufferSize[int](64),
 		pipex.WithFailFast[int](true),
 		pipex.WithTriggers[int](tr),
+		pipex.WithHooks[int](hooks),
 	)
 	if err != nil {
 		panic(err)
@@ -79,4 +94,5 @@ func main() {
 
 	fmt.Println("src outputs:", len(res["src"]))
 	fmt.Println("sink outputs:", len(res["sink"]))
+	fmt.Println("stage finish events:", stageFinishCount.Load())
 }

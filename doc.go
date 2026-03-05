@@ -17,5 +17,9 @@
 // See runnable examples in:
 //   - examples/quickstart
 //   - examples/sink
+//
+// User guides:
+//   - docs/hooks.md
+//   - docs/triggers.md
+//   - docs/sinks.md
 package pipex
-
