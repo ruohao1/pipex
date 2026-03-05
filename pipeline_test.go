@@ -383,6 +383,26 @@ func TestRunStageRateLimitsUnknownStageRejected(t *testing.T) {
 	}
 }
 
+func TestRunStagePoliciesUnknownStageRejected(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStagePolicies[int](map[string]StagePolicy{
+			"missing": {
+				MaxAttempts: 2,
+				Backoff:     5 * time.Millisecond,
+				Timeout:     10 * time.Millisecond,
+			},
+		}),
+	)
+	if !errors.Is(err, ErrStageNotFound) {
+		t.Fatalf("expected ErrStageNotFound for unknown stage policy override, got %v", err)
+	}
+}
+
 func TestRunStageRateLimitsInvalidRPSRejected(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
