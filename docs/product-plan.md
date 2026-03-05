@@ -70,8 +70,8 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 
 ## Active TODO
 
-- [ ] Link the v1 breaking-change issue number in this doc.
-- [ ] Add `docs/migration-v1.md` draft before v1 API freeze.
+- [x] Link the v1 breaking-change issue number in this doc (issue: `#1`).
+- [x] Add `docs/migration-v1.md` draft before v1 API freeze.
 - [ ] Keep release notes synchronized with completed milestone checkboxes.
 
 ## Working Agreement

@@ -1,6 +1,14 @@
 # pipex
 A library to help you create pipelines in Golang
 
+## Installation
+
+Requires Go `1.25+`.
+
+```bash
+go get github.com/ruohao1/pipex@latest
+```
+
 ## User Docs
 
 - Hooks: `docs/hooks.md`
