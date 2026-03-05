@@ -42,7 +42,6 @@ type Hooks[T any] struct {
 	SinkExhausted      func(ctx context.Context, e SinkExhaustedEvent[T])
 
 	CycleHopLimitDrop    func(ctx context.Context, e CycleHopLimitDropEvent[T])
-	CycleDedupDrop       func(ctx context.Context, e CycleDedupDropEvent[T])
 	CycleMaxJobsExceeded func(ctx context.Context, e CycleMaxJobsExceededEvent[T])
 
 	DedupDrop func(ctx context.Context, e DedupDropEvent[T])
@@ -203,16 +202,6 @@ type CycleHopLimitDropEvent[T any] struct {
 	Hops    int
 	MaxHops int
 	At      time.Time
-}
-
-// CycleDedupDropEvent is emitted when an enqueue is dropped because the
-// (stage, dedupKey(item)) tuple was already seen in this run.
-type CycleDedupDropEvent[T any] struct {
-	RunID string
-	Stage string
-	Item  T
-	Key   string
-	At    time.Time
 }
 
 // CycleMaxJobsExceededEvent is emitted when an enqueue is rejected because the

@@ -15,6 +15,7 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 - Cycle mode is available with hop/job guardrails.
 - Stage/global dedup rules are available via `WithDedupRules(...)`.
 - Stage rate limiting is available via `WithStageRateLimits(...)`.
+- Stage retry/timeout policies are available via `WithStagePolicies(...)`.
 - Cycle dedup key in `WithCycleMode(...)` is on a deprecation path in favor of `WithDedupRules(...)`.
 
 ## Milestones
@@ -37,10 +38,11 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 - [x] Cycle dedup compatibility routed through unified dedup runtime.
 - [x] Deprecation docs for cycle dedup key.
 
-## `v0.3.x` stabilization (next patch line)
+## `v0.3.1` (released)
 
-- [ ] CI race-test gate (`go test -race ./...`).
-- [ ] Add a focused test for `WithCycleMode + WithDedupRules` interaction.
+- [x] CI race-test gate (`go test -race ./...`).
+- [x] Added focused interaction tests for cycle mode + dedup rules.
+- [x] Added stage retry/timeout policies and attempt-level hook coverage.
 
 ## `v1.0.0` breaking cleanup
 
@@ -72,7 +74,7 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 
 - [x] Link the v1 breaking-change issue number in this doc (issue: `#1`).
 - [x] Add `docs/migration-v1.md` draft before v1 API freeze.
-- [ ] Keep release notes synchronized with completed milestone checkboxes.
+- [x] Keep release notes synchronized with completed milestone checkboxes.
 
 ## Working Agreement
 

@@ -35,7 +35,7 @@ go get github.com/ruohao1/pipex@latest
 - `WithStageRateLimits(map[string]RateLimit)`: per-run per-stage rate limits (`RPS > 0`, `Burst >= 1`).
 - `WithStagePolicies(map[string]StagePolicy)`: per-run per-stage retry/timeout policy (`MaxAttempts >= 1`, `Backoff >= 0`, `Timeout >= 0`).
 - `WithDedupRules(...)`: per-run dedup rules (`global` or `stage:<name>` scope).
-- `WithCycleMode(maxHops, maxJobs, dedupKey)`: cycle traversal guardrails. `dedupKey` is deprecated; use `WithDedupRules(...)` for dedup configuration.
+- `WithCycleMode(maxHops, maxJobs)`: cycle traversal guardrails (hop and max-jobs limits). Use `WithDedupRules(...)` for dedup behavior.
 
 Defaults:
 
