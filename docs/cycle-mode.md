@@ -41,6 +41,19 @@ Cycle mode uses three guardrails to prevent runaway recursion:
 3. Optional dedup (`dedupKey`)
 - Prevents revisiting same stage/key pair in one run.
 
+## Cycle Hook Events
+
+When hooks are configured with `WithHooks(...)`, cycle guardrails can emit:
+
+- `CycleHopLimitDrop`
+  - emitted when enqueue is skipped because `hops > maxHops`.
+- `CycleDedupDrop`
+  - emitted when enqueue is skipped because `(stage, dedupKey(item))` is already seen.
+- `CycleMaxJobsExceeded`
+  - emitted when enqueue is rejected because max-jobs budget is exhausted.
+
+These events are enqueue/frontier signals (not stage-processing events).
+
 ## Validation Behavior
 
 - `Run` validation:

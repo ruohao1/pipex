@@ -1086,3 +1086,78 @@ func TestRunCycleModeDedupStopsRevisit(t *testing.T) {
 		t.Fatalf("unexpected stage b count with dedup: got %d want %d", got, 1)
 	}
 }
+
+func TestRunCycleModeDedupKeyPanicReturnsError(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("b", "a")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": {1}},
+			WithCycleMode[int](-1, 100, func(v int) string {
+				panic("dedup panic")
+			}),
+		)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected dedup key panic to surface as run error")
+		}
+		if got := err.Error(); !strings.Contains(got, "cycle dedup key panic") {
+			t.Fatalf("expected dedup panic error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run appears stuck after dedup key panic")
+	}
+}
+
+func TestRunCycleModeMaxJobsBoundUnderConcurrentEnqueue(t *testing.T) {
+	const (
+		maxJobs    = 20
+		iterations = 20
+	)
+
+	for i := 0; i < iterations; i++ {
+		p := NewPipeline[int]()
+		_ = p.AddStage(testStage[int]{
+			name:    "a",
+			workers: 8,
+			fn: func(ctx context.Context, in int) ([]int, error) {
+				return []int{in}, nil
+			},
+		})
+		_ = p.AddStage(testStage[int]{
+			name:    "b",
+			workers: 8,
+			fn: func(ctx context.Context, in int) ([]int, error) {
+				return []int{in}, nil
+			},
+		})
+		_ = p.Connect("a", "b")
+		_ = p.Connect("b", "a")
+
+		res, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": {1}},
+			WithCycleMode[int](-1, maxJobs, nil),
+			WithFailFast[int](true),
+			WithPartialResults[int](true),
+		)
+		if !errors.Is(err, ErrCycleModeMaxJobsExceeded) {
+			t.Fatalf("iteration %d: expected ErrCycleModeMaxJobsExceeded, got %v", i, err)
+		}
+
+		totalProcessed := len(res["a"]) + len(res["b"])
+		if totalProcessed > maxJobs {
+			t.Fatalf("iteration %d: processed jobs exceeded maxJobs: got %d want <= %d", i, totalProcessed, maxJobs)
+		}
+	}
+}

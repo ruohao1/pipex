@@ -137,7 +137,8 @@ type SinkExhaustedEvent[T any] struct {
 	At       time.Time
 }
 
-// Cycle events
+// CycleHopLimitDropEvent is emitted when an enqueue is dropped because hop
+// count exceeded the configured cycle-mode MaxHops.
 type CycleHopLimitDropEvent[T any] struct {
 	RunID   string
 	Stage   string
@@ -147,6 +148,8 @@ type CycleHopLimitDropEvent[T any] struct {
 	At      time.Time
 }
 
+// CycleDedupDropEvent is emitted when an enqueue is dropped because the
+// (stage, dedupKey(item)) tuple was already seen in this run.
 type CycleDedupDropEvent[T any] struct {
 	RunID string
 	Stage string
@@ -155,6 +158,8 @@ type CycleDedupDropEvent[T any] struct {
 	At    time.Time
 }
 
+// CycleMaxJobsExceededEvent is emitted when an enqueue is rejected because the
+// configured cycle-mode MaxJobs budget is exhausted.
 type CycleMaxJobsExceededEvent[T any] struct {
 	RunID        string
 	Stage        string

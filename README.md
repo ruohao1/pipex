@@ -153,15 +153,4 @@ go run ./examples/sink
 go run ./examples/cycle
 ```
 
-## Cycle Mode Options
-
-`WithCycleMode(maxHops, maxJobs, dedupKey)` enables cyclic execution in `Run` with guardrails:
-
-- `maxHops`: max edge traversals from ingress (`-1` for unlimited).
-- `maxJobs`: max accepted jobs for the run (`> 0` required).
-- `dedupKey`: optional `func(T) string` for run-local dedup by `(stage, key)`.
-
-When cycle mode is enabled:
-
-- `Run` allows cyclic graphs.
-- `Validate()` remains DAG-only.
+For cycle mode options and behavior details, see `docs/cycle-mode.md`.
