@@ -599,6 +599,99 @@ func TestRunDedupRollbackOnEnqueueFailureDoesNotLeakKey(t *testing.T) {
 	}
 }
 
+func TestRunDedupRollbackOnMaxHopsDropDoesNotLeakKey(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "s",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in}, nil
+		},
+	})
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			// Delay short path so long path reaches target stage first.
+			time.Sleep(25 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "c", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "t", workers: 1})
+
+	_ = p.Connect("s", "a") // s->a->t is hops=2 (allowed)
+	_ = p.Connect("s", "b") // s->b->c->t is hops=3 (dropped by max hops)
+	_ = p.Connect("a", "t")
+	_ = p.Connect("b", "c")
+	_ = p.Connect("c", "t")
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"s": {1}},
+		WithCycleMode[int](2, 100, nil),
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "t-only",
+			Scope: DedupScopeStage("t"),
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["t"]); got != 1 {
+		t.Fatalf("expected target stage to process once after hop-limit drop rollback, got t=%v", res["t"])
+	}
+}
+
+func TestRunDedupRollbackOnLaterRulePanicDoesNotLeakEarlierRuleKey(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	var panicOnce atomic.Bool
+	panicOnce.Store(true)
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 1}},
+		WithPartialResults[int](true),
+		WithDedupRules[int](
+			DedupRule[int]{
+				Name:  "first",
+				Scope: DedupScopeStage("a"),
+				Key: func(v int) string {
+					return fmt.Sprintf("%d", v)
+				},
+			},
+			DedupRule[int]{
+				Name:  "panic-once",
+				Scope: DedupScopeStage("a"),
+				Key: func(v int) string {
+					if panicOnce.CompareAndSwap(true, false) {
+						panic("boom")
+					}
+					return fmt.Sprintf("%d", v)
+				},
+			},
+		),
+	)
+	if err == nil {
+		t.Fatal("expected dedup panic error")
+	}
+	if got := err.Error(); !strings.Contains(got, "dedup key panic") {
+		t.Fatalf("expected dedup panic error, got %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected partial results map, got nil")
+	}
+	if got := len(res["a"]); got != 1 {
+		t.Fatalf("expected second item to process after rollback from first-item panic, got a=%v", res["a"])
+	}
+}
+
 func TestRunFailFastWithQueuedJobsDoesNotHang(t *testing.T) {
 	p := NewPipeline[int]()
 	wantErr := errors.New("boom")
