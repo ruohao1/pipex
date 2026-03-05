@@ -7,6 +7,7 @@ type RunOptions[T any] struct {
 	FailFast             bool
 	Triggers             []Trigger[T]
 	Sinks                []Sink[T]
+	Hooks								Hooks[T]
 	SinkRetry            SinkRetryPolicy
 	ReturnPartialResults bool
 }
@@ -61,6 +62,12 @@ func WithSinks[T any](sinks ...Sink[T]) Option[T] {
 			return
 		}
 		opts.Sinks = append(opts.Sinks, sinks...)
+	}
+}
+
+func WithHooks[T any](hooks Hooks[T]) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.Hooks = hooks
 	}
 }
 
