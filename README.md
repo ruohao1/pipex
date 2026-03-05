@@ -10,6 +10,7 @@ A library to help you create pipelines in Golang
 - Stage workers: `docs/stage-workers.md`
 - Rate limits: `docs/rate-limits.md`
 - Dedup rules: `docs/dedup.md`
+- Product plan: `docs/product-plan.md`
 
 ## Run Options
 

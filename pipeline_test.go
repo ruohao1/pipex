@@ -1463,6 +1463,36 @@ func TestRunCycleModeDedupStopsRevisit(t *testing.T) {
 	}
 }
 
+func TestRunCycleModeAndDedupRulesNoCrossRuleCollision(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("b", "a")
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) }),
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "global-dedup",
+			Scope: DedupScopeGlobal,
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["a"]); got != 1 {
+		t.Fatalf("expected stage a to process once, got %v", res["a"])
+	}
+	if got := len(res["b"]); got != 1 {
+		t.Fatalf("expected stage b to process once, got %v", res["b"])
+	}
+}
+
 func TestRunCycleModeDedupKeyPanicReturnsError(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 1})

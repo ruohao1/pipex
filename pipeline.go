@@ -430,8 +430,9 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					return derr
 				}
 				key = stageName + "\x00" + dedupKeyValue
+				dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
 				seenMu.Lock()
-				if _, exists := seen[key]; exists {
+				if _, exists := seen[dedupMapKey]; exists {
 					seenMu.Unlock()
 					if stageRule.isCycleCompat {
 						iruntime.Call2(runOpts.Hooks.CycleDedupDrop, runCtx, CycleDedupDropEvent[T]{
@@ -452,8 +453,8 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					}
 					return nil
 				}
-				seen[key] = struct{}{}
-				dedupInsertedKeys = append(dedupInsertedKeys, key)
+				seen[dedupMapKey] = struct{}{}
+				dedupInsertedKeys = append(dedupInsertedKeys, dedupMapKey)
 				seenMu.Unlock()
 			}
 		}

@@ -123,6 +123,51 @@ func TestCycleHookDedupDropPayload(t *testing.T) {
 	}
 }
 
+func TestCycleModeWithDedupRulesEmitsSingleDedupHookPath(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("b", "a")
+
+	var (
+		dedupDrops      atomic.Int64
+		cycleDedupDrops atomic.Int64
+	)
+
+	hooks := Hooks[int]{
+		DedupDrop: func(ctx context.Context, e DedupDropEvent[int]) {
+			dedupDrops.Add(1)
+		},
+		CycleDedupDrop: func(ctx context.Context, e CycleDedupDropEvent[int]) {
+			cycleDedupDrops.Add(1)
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithHooks[int](hooks),
+		WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) }),
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "global-dedup",
+			Scope: DedupScopeGlobal,
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if dedupDrops.Load() == 0 {
+		t.Fatal("expected dedup drops to be reported via DedupDrop when explicit dedup rule is configured")
+	}
+	if cycleDedupDrops.Load() != 0 {
+		t.Fatalf("expected no CycleDedupDrop events with explicit dedup rules, got %d", cycleDedupDrops.Load())
+	}
+}
+
 func TestCycleHookMaxJobsExceededPayload(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
