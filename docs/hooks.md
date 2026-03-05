@@ -55,6 +55,11 @@ Stage-level:
 - `StageStart(ctx, StageStartEvent[T])`
 - `StageFinish(ctx, StageFinishEvent[T])`
 - `StageError(ctx, StageErrorEvent[T])`
+- `StageAttemptStart(ctx, StageAttemptStartEvent[T])`
+- `StageAttemptError(ctx, StageAttemptErrorEvent[T])`
+- `StageRetry(ctx, StageRetryEvent[T])`
+- `StageTimeout(ctx, StageTimeoutEvent[T])`
+- `StageExhausted(ctx, StageExhaustedEvent[T])`
 
 Trigger-level:
 
@@ -73,7 +78,10 @@ Sink-level:
 
 Ordering is guaranteed only for local lifecycle paths:
 
-- Stage item: `StageStart` -> (`StageFinish` or `StageError`)
+- Stage item (item-level): `StageStart` -> (`StageFinish` or `StageError`)
+- Stage attempt (attempt-level, when retries/timeouts enabled):
+  - `StageAttemptStart` -> (`StageAttemptError` -> optional `StageTimeout` -> optional `StageRetry`)
+  - final failed attempt also emits `StageExhausted`, then item-level `StageError`
 - Trigger run: `TriggerStart` -> (`TriggerEnd` or `TriggerError`)
 - Sink attempt: `SinkConsumeStart` -> (`SinkConsumeSuccess` or `SinkRetry` or `SinkExhausted`)
 
@@ -83,6 +91,14 @@ Global ordering across workers/stages is not guaranteed.
 
 - `SinkRetry` is emitted after a failed consume attempt and before backoff sleep.
 - `SinkExhausted` is emitted once when retry budget is exceeded for that sink item path.
+
+## Stage Retry/Timeout Notes
+
+- `StageStart`/`StageFinish`/`StageError` are item-level terminal hooks (once per enqueued item path).
+- `StageAttemptStart` and `StageAttemptError` are per-attempt hooks.
+- `StageTimeout` is emitted when an attempt context hits deadline.
+- `StageRetry` is emitted after a failed attempt when retries remain.
+- `StageExhausted` is emitted once on the last failed attempt before item-level `StageError`.
 
 ## Safety Notes
 

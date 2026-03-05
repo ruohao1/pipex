@@ -3,6 +3,7 @@ package pipex
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -559,6 +560,197 @@ func TestHooksDedupDropPayload(t *testing.T) {
 	}
 	if dropEvt.Key != "a\x00k" {
 		t.Fatalf("unexpected dedup key: got %q want %q", dropEvt.Key, "a\x00k")
+	}
+}
+
+func TestHooksStageAttemptRetrySequence(t *testing.T) {
+	p := NewPipeline[int]()
+	var attempts atomic.Int64
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			if attempts.Add(1) == 1 {
+				return nil, errors.New("transient")
+			}
+			return []int{in}, nil
+		},
+	})
+
+	var (
+		mu     sync.Mutex
+		events []string
+	)
+	hooks := Hooks[int]{
+		StageStart: func(ctx context.Context, e StageStartEvent[int]) {
+			mu.Lock()
+			events = append(events, "stage_start")
+			mu.Unlock()
+		},
+		StageAttemptStart: func(ctx context.Context, e StageAttemptStartEvent[int]) {
+			mu.Lock()
+			events = append(events, "attempt_start_"+strconv.Itoa(e.Attempt))
+			mu.Unlock()
+		},
+		StageAttemptError: func(ctx context.Context, e StageAttemptErrorEvent[int]) {
+			mu.Lock()
+			events = append(events, "attempt_error_"+strconv.Itoa(e.Attempt))
+			mu.Unlock()
+		},
+		StageRetry: func(ctx context.Context, e StageRetryEvent[int]) {
+			mu.Lock()
+			events = append(events, "retry_"+strconv.Itoa(e.Attempt))
+			mu.Unlock()
+		},
+		StageFinish: func(ctx context.Context, e StageFinishEvent[int]) {
+			mu.Lock()
+			events = append(events, "stage_finish")
+			mu.Unlock()
+		},
+		StageTimeout: func(ctx context.Context, e StageTimeoutEvent[int]) {
+			mu.Lock()
+			events = append(events, "timeout")
+			mu.Unlock()
+		},
+		StageExhausted: func(ctx context.Context, e StageExhaustedEvent[int]) {
+			mu.Lock()
+			events = append(events, "exhausted")
+			mu.Unlock()
+		},
+		StageError: func(ctx context.Context, e StageErrorEvent[int]) {
+			mu.Lock()
+			events = append(events, "stage_error")
+			mu.Unlock()
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStagePolicies[int](map[string]StagePolicy{
+			"a": {MaxAttempts: 2},
+		}),
+		WithHooks[int](hooks),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	want := []string{
+		"stage_start",
+		"attempt_start_1",
+		"attempt_error_1",
+		"retry_1",
+		"attempt_start_2",
+		"stage_finish",
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != len(want) {
+		t.Fatalf("unexpected events len: got %d want %d events=%v", len(events), len(want), events)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("unexpected event at %d: got %q want %q all=%v", i, events[i], want[i], events)
+		}
+	}
+}
+
+func TestHooksStageAttemptTimeoutAndExhaustedSequence(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+
+	var (
+		mu     sync.Mutex
+		events []string
+	)
+	hooks := Hooks[int]{
+		StageStart: func(ctx context.Context, e StageStartEvent[int]) {
+			mu.Lock()
+			events = append(events, "stage_start")
+			mu.Unlock()
+		},
+		StageAttemptStart: func(ctx context.Context, e StageAttemptStartEvent[int]) {
+			mu.Lock()
+			events = append(events, "attempt_start_"+strconv.Itoa(e.Attempt))
+			mu.Unlock()
+		},
+		StageAttemptError: func(ctx context.Context, e StageAttemptErrorEvent[int]) {
+			mu.Lock()
+			events = append(events, "attempt_error_"+strconv.Itoa(e.Attempt))
+			mu.Unlock()
+		},
+		StageTimeout: func(ctx context.Context, e StageTimeoutEvent[int]) {
+			mu.Lock()
+			events = append(events, "timeout_"+strconv.Itoa(e.Attempt))
+			mu.Unlock()
+		},
+		StageRetry: func(ctx context.Context, e StageRetryEvent[int]) {
+			mu.Lock()
+			events = append(events, "retry_"+strconv.Itoa(e.Attempt))
+			mu.Unlock()
+		},
+		StageExhausted: func(ctx context.Context, e StageExhaustedEvent[int]) {
+			mu.Lock()
+			events = append(events, "exhausted")
+			mu.Unlock()
+		},
+		StageError: func(ctx context.Context, e StageErrorEvent[int]) {
+			mu.Lock()
+			events = append(events, "stage_error")
+			mu.Unlock()
+		},
+		StageFinish: func(ctx context.Context, e StageFinishEvent[int]) {
+			mu.Lock()
+			events = append(events, "stage_finish")
+			mu.Unlock()
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStagePolicies[int](map[string]StagePolicy{
+			"a": {MaxAttempts: 2, Timeout: 10 * time.Millisecond},
+		}),
+		WithHooks[int](hooks),
+	)
+	// Run currently suppresses context-derived errors from worker jobs in
+	// non-fail-fast mode; this test focuses on hook sequencing guarantees.
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	want := []string{
+		"stage_start",
+		"attempt_start_1",
+		"attempt_error_1",
+		"timeout_1",
+		"retry_1",
+		"attempt_start_2",
+		"attempt_error_2",
+		"timeout_2",
+		"exhausted",
+		"stage_error",
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != len(want) {
+		t.Fatalf("unexpected events len: got %d want %d events=%v", len(events), len(want), events)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("unexpected event at %d: got %q want %q all=%v", i, events[i], want[i], events)
+		}
 	}
 }
 

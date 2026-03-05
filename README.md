@@ -33,6 +33,7 @@ go get github.com/ruohao1/pipex@latest
 - `WithPartialResults(v)`: when `true`, return currently collected results together with an error.
 - `WithStageWorkers(map[string]int)`: per-run per-stage worker overrides (must reference existing stages; each value must be `> 0`).
 - `WithStageRateLimits(map[string]RateLimit)`: per-run per-stage rate limits (`RPS > 0`, `Burst >= 1`).
+- `WithStagePolicies(map[string]StagePolicy)`: per-run per-stage retry/timeout policy (`MaxAttempts >= 1`, `Backoff >= 0`, `Timeout >= 0`).
 - `WithDedupRules(...)`: per-run dedup rules (`global` or `stage:<name>` scope).
 - `WithCycleMode(maxHops, maxJobs, dedupKey)`: cycle traversal guardrails. `dedupKey` is deprecated; use `WithDedupRules(...)` for dedup configuration.
 
@@ -50,6 +51,7 @@ Defaults:
 - Trigger and sink errors are also joined into the returned error.
 - Invalid `WithStageWorkers(...)` configuration (unknown stage or non-positive worker count) returns a run error before processing starts.
 - Invalid `WithStageRateLimits(...)` configuration (unknown stage, non-positive `RPS`, or `Burst < 1`) returns a run error before processing starts.
+- Invalid `WithStagePolicies(...)` configuration (unknown stage, `MaxAttempts < 1`, negative backoff, or negative timeout) returns a run error before processing starts.
 - Invalid `WithDedupRules(...)` configuration (empty name/scope, nil key, invalid scope format, or unknown stage in `stage:<name>`) returns a run error before processing starts.
 - When `FailFast=true`, the first stage error cancels the run, and the stage error is returned (not `context.Canceled`).
 - If there are no stage errors but the context is canceled or times out, `Run` returns the context error.
