@@ -1,6 +1,12 @@
 # pipex
 A library to help you create pipelines in Golang
 
+## User Docs
+
+- Hooks: `docs/hooks.md`
+- Triggers: `docs/triggers.md`
+- Sinks: `docs/sinks.md`
+
 ## Run Options
 
 `Run` supports optional runtime behavior via `Option`:
@@ -9,6 +15,7 @@ A library to help you create pipelines in Golang
 - `WithFailFast(v)`: when `true`, cancel execution on first stage error.
 - `WithTriggers(...)`: register trigger sources that emit items during runtime.
 - `WithSinks(...)`: register sinks that consume stage outputs per item during runtime.
+- `WithHooks(...)`: register runtime observability callbacks.
 - `WithSinkRetry(maxRetries, backoff)`: configure sink retry policy.
 - `WithPartialResults(v)`: when `true`, return currently collected results together with an error.
 
@@ -45,6 +52,35 @@ Defaults:
   - that sink is disabled for the remainder of the run,
   - pipeline processing continues unless `WithFailFast(true)` is enabled.
 - On cancellation, sink workers stop via `ctx.Done()`.
+
+## Hooks
+
+- Hooks provide runtime observability and do not alter pipeline control flow.
+- Run-level callbacks: `RunStart`, `RunEnd`.
+- Stage callbacks: `StageStart`, `StageFinish`, `StageError`.
+- Trigger callbacks: `TriggerStart`, `TriggerEnd`, `TriggerError`.
+- Sink callbacks: `SinkConsumeStart`, `SinkConsumeSuccess`, `SinkRetry`, `SinkExhausted`.
+
+Minimal example:
+
+```go
+hooks := pipex.Hooks[int]{
+	RunStart: func(ctx context.Context, meta pipex.RunMeta) {
+		fmt.Println("run start", meta.RunID)
+	},
+	RunEnd: func(ctx context.Context, meta pipex.RunMeta, err error) {
+		fmt.Println("run end", meta.RunID, "err:", err)
+	},
+}
+
+_, _ = p.Run(
+	context.Background(),
+	map[string][]int{"src": {1, 2, 3}},
+	pipex.WithHooks[int](hooks),
+)
+```
+
+See detailed contract: `docs/hooks.md`.
 
 ## Retry Policy Guide
 
