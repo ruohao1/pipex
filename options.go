@@ -16,6 +16,7 @@ type RunOptions[T any] struct {
 	ReturnPartialResults bool
 	StageWorkers         map[string]int
 	StageRateLimits      map[string]RateLimit
+	StagePolicies        map[string]StagePolicy
 	DedupRules           []DedupRule[T]
 }
 
@@ -37,6 +38,12 @@ type SinkRetryPolicy struct {
 type RateLimit struct {
 	RPS   float64
 	Burst int
+}
+
+type StagePolicy struct {
+	MaxAttempts int
+	Backoff     time.Duration
+	Timeout     time.Duration
 }
 
 type DedupScope string
@@ -77,6 +84,8 @@ func defaultOptions[T any]() *RunOptions[T] {
 		ReturnPartialResults: false,
 		StageWorkers:         map[string]int{},
 		StageRateLimits:      map[string]RateLimit{},
+		StagePolicies:        map[string]StagePolicy{},
+		DedupRules:           []DedupRule[T]{},
 	}
 }
 
@@ -166,6 +175,14 @@ func WithStageRateLimits[T any](stageRateLimits map[string]RateLimit) Option[T] 
 		stageRateLimitsCopy := make(map[string]RateLimit, len(stageRateLimits))
 		maps.Copy(stageRateLimitsCopy, stageRateLimits)
 		opts.StageRateLimits = stageRateLimitsCopy
+	}
+}
+
+func WithStagePolicies[T any](stagePolicies map[string]StagePolicy) Option[T] {
+	return func(opts *RunOptions[T]) {
+		stagePoliciesCopy := make(map[string]StagePolicy, len(stagePolicies))
+		maps.Copy(stagePoliciesCopy, stagePolicies)
+		opts.StagePolicies = stagePoliciesCopy
 	}
 }
 

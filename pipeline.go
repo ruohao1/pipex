@@ -150,6 +150,25 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 	}
 
+	for stageName, policy := range runOpts.StagePolicies {
+		if _, ok := stages[stageName]; !ok {
+			retErr = fmt.Errorf("stage policies config: %w", StageNotFound(stageName))
+			return nil, retErr
+		}
+		if policy.MaxAttempts < 1 {
+			retErr = fmt.Errorf("invalid stage policy max attempts %d: %w", policy.MaxAttempts, ErrInvalidStagePolicyMaxAttempts)
+			return nil, retErr
+		}
+		if policy.Backoff < 0 {
+			retErr = fmt.Errorf("invalid stage policy backoff %s: %w", policy.Backoff, ErrInvalidStagePolicyBackoff)
+			return nil, retErr
+		}
+		if policy.Timeout < 0 {
+			retErr = fmt.Errorf("invalid stage policy timeout %s: %w", policy.Timeout, ErrInvalidStagePolicyTimeout)
+			return nil, retErr
+		}
+	}
+
 	if ctx.Err() != nil {
 		retErr = ctx.Err()
 		return nil, retErr
@@ -200,6 +219,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			}
 		}
 	}
+
 	if runOpts.CycleMode.Enabled && runOpts.CycleMode.DedupKey != nil {
 		for stageName := range stages {
 			dedupRulesByStage[stageName] = append(dedupRulesByStage[stageName], stageDedupRule[T]{
@@ -426,10 +446,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					}()
 					return rule.Key(in), nil
 				}()
-					if derr != nil {
-						rollbackDedup()
-						return derr
-					}
+				if derr != nil {
+					rollbackDedup()
+					return derr
+				}
 				key = stageName + "\x00" + dedupKeyValue
 				dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
 				seenMu.Lock()
@@ -462,11 +482,11 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		if runOpts.CycleMode.Enabled {
 			at := time.Now()
 			frontierMu.Lock()
-				if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
-					rollbackDedup()
-					frontierMu.Unlock()
-					iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
-						RunID:   runID,
+			if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
+				rollbackDedup()
+				frontierMu.Unlock()
+				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
+					RunID:   runID,
 					Stage:   stageName,
 					Item:    in,
 					Hops:    hops,
@@ -512,37 +532,144 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					}
 				}
 
-				startTime := time.Now()
+				policy, hasPolicy := runOpts.StagePolicies[stageName]
+				if !hasPolicy {
+					policy = StagePolicy{MaxAttempts: 1}
+				}
+				if policy.MaxAttempts <= 0 {
+					policy.MaxAttempts = 1
+				}
+
+				stageStart := time.Now()
 				iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
 					RunID:     runID,
 					Stage:     stageName,
 					Input:     in,
-					StartedAt: startTime,
+					StartedAt: stageStart,
 				})
-				out, err := stage.Process(runCtx, in)
-				finishTime := time.Now()
-				duration := finishTime.Sub(startTime)
-				if err != nil {
-					iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
+
+				var (
+					out []T
+					err error
+				)
+
+				for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+					attemptCtx := runCtx
+					var cancel context.CancelFunc = func() {}
+					if policy.Timeout > 0 {
+						attemptCtx, cancel = context.WithTimeout(runCtx, policy.Timeout)
+					}
+
+					attemptStart := time.Now()
+					iruntime.Call2(runOpts.Hooks.StageAttemptStart, runCtx, StageAttemptStartEvent[T]{
+						RunID:     runID,
+						Stage:     stageName,
+						Input:     in,
+						Attempt:   attempt,
+						StartedAt: attemptStart,
+					})
+					out, err = stage.Process(attemptCtx, in)
+					attemptFinish := time.Now()
+					attemptDuration := attemptFinish.Sub(attemptStart)
+					cancel()
+
+					if err == nil {
+						iruntime.Call2(runOpts.Hooks.StageFinish, runCtx, StageFinishEvent[T]{
+							RunID:      runID,
+							Stage:      stageName,
+							Input:      in,
+							OutCount:   len(out),
+							StartedAt:  stageStart,
+							FinishedAt: attemptFinish,
+							Duration:   attemptFinish.Sub(stageStart),
+						})
+						break
+					}
+
+					iruntime.Call2(runOpts.Hooks.StageAttemptError, runCtx, StageAttemptErrorEvent[T]{
 						RunID:      runID,
 						Stage:      stageName,
 						Input:      in,
-						StartedAt:  startTime,
-						FinishedAt: finishTime,
-						Duration:   duration,
+						Attempt:    attempt,
+						StartedAt:  attemptStart,
+						FinishedAt: attemptFinish,
+						Duration:   attemptDuration,
 						Err:        err,
 					})
+					if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+						iruntime.Call2(runOpts.Hooks.StageTimeout, runCtx, StageTimeoutEvent[T]{
+							RunID:     runID,
+							Stage:     stageName,
+							Input:     in,
+							Attempt:   attempt,
+							StartedAt: attemptStart,
+							Timeout:   policy.Timeout,
+							At:        attemptFinish,
+						})
+					}
+
+					// stop immediately on run cancellation
+					if runCtx.Err() != nil {
+						if !isContextErr(err) {
+							iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
+								RunID:      runID,
+								Stage:      stageName,
+								Input:      in,
+								StartedAt:  stageStart,
+								FinishedAt: attemptFinish,
+								Duration:   attemptFinish.Sub(stageStart),
+								Err:        err,
+							})
+							return fmt.Errorf("stage %s: %w", stageName, err)
+						}
+						return runCtx.Err()
+					}
+
+					// no retries left
+					if attempt == policy.MaxAttempts {
+						iruntime.Call2(runOpts.Hooks.StageExhausted, runCtx, StageExhaustedEvent[T]{
+							RunID:    runID,
+							Stage:    stageName,
+							Input:    in,
+							Attempts: attempt,
+							Err:      err,
+							At:       attemptFinish,
+						})
+						iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
+							RunID:      runID,
+							Stage:      stageName,
+							Input:      in,
+							StartedAt:  stageStart,
+							FinishedAt: attemptFinish,
+							Duration:   attemptFinish.Sub(stageStart),
+							Err:        err,
+						})
+						break
+					}
+
+					iruntime.Call2(runOpts.Hooks.StageRetry, runCtx, StageRetryEvent[T]{
+						RunID:   runID,
+						Stage:   stageName,
+						Input:   in,
+						Attempt: attempt,
+						Err:     err,
+						Backoff: policy.Backoff,
+						At:      attemptFinish,
+					})
+
+					// context-aware backoff
+					if policy.Backoff > 0 {
+						select {
+						case <-runCtx.Done():
+							return runCtx.Err()
+						case <-time.After(policy.Backoff):
+						}
+					}
+				}
+
+				if err != nil {
 					return fmt.Errorf("stage %s: %w", stageName, err)
 				}
-				iruntime.Call2(runOpts.Hooks.StageFinish, runCtx, StageFinishEvent[T]{
-					RunID:      runID,
-					Stage:      stageName,
-					Input:      in,
-					OutCount:   len(out),
-					StartedAt:  startTime,
-					FinishedAt: finishTime,
-					Duration:   duration,
-				})
 
 				resultsMu.Lock()
 				results[stageName] = append(results[stageName], out...)

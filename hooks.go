@@ -23,9 +23,14 @@ type Hooks[T any] struct {
 	RunStart func(ctx context.Context, meta RunMeta)
 	RunEnd   func(ctx context.Context, meta RunMeta, err error)
 
-	StageStart  func(ctx context.Context, e StageStartEvent[T])
-	StageFinish func(ctx context.Context, e StageFinishEvent[T])
-	StageError  func(ctx context.Context, e StageErrorEvent[T])
+	StageStart        func(ctx context.Context, e StageStartEvent[T])
+	StageFinish       func(ctx context.Context, e StageFinishEvent[T])
+	StageError        func(ctx context.Context, e StageErrorEvent[T])
+	StageAttemptStart func(ctx context.Context, e StageAttemptStartEvent[T])
+	StageAttemptError func(ctx context.Context, e StageAttemptErrorEvent[T])
+	StageRetry        func(ctx context.Context, e StageRetryEvent[T])
+	StageTimeout      func(ctx context.Context, e StageTimeoutEvent[T])
+	StageExhausted    func(ctx context.Context, e StageExhaustedEvent[T])
 
 	TriggerStart func(ctx context.Context, e TriggerStartEvent[T])
 	TriggerEnd   func(ctx context.Context, e TriggerEndEvent[T])
@@ -69,6 +74,54 @@ type StageErrorEvent[T any] struct {
 	FinishedAt time.Time
 	Duration   time.Duration
 	Err        error
+}
+
+type StageAttemptStartEvent[T any] struct {
+	RunID     string
+	Stage     string
+	Input     T
+	Attempt   int
+	StartedAt time.Time
+}
+
+type StageAttemptErrorEvent[T any] struct {
+	RunID      string
+	Stage      string
+	Input      T
+	Attempt    int
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Duration   time.Duration
+	Err        error
+}
+
+type StageRetryEvent[T any] struct {
+	RunID   string
+	Stage   string
+	Input   T
+	Attempt int
+	Err     error
+	Backoff time.Duration
+	At      time.Time
+}
+
+type StageTimeoutEvent[T any] struct {
+	RunID     string
+	Stage     string
+	Input     T
+	Attempt   int
+	StartedAt time.Time
+	Timeout   time.Duration
+	At        time.Time
+}
+
+type StageExhaustedEvent[T any] struct {
+	RunID    string
+	Stage    string
+	Input    T
+	Attempts int
+	Err      error
+	At       time.Time
 }
 
 // Trigger events
@@ -181,4 +234,3 @@ type DedupDropEvent[T any] struct {
 	Item  T
 	At    time.Time
 }
-

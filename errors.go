@@ -35,6 +35,10 @@ var (
 	ErrInvalidDedupRuleName  = errors.New("dedup rule name cannot be empty")
 	ErrInvalidDedupRuleScope = errors.New("dedup rule scope cannot be empty")
 	ErrInvalidDedupRuleKey   = errors.New("dedup rule key function cannot be nil")
+
+	ErrInvalidStagePolicyMaxAttempts = errors.New("stage policy max attempts must be greater than zero")
+	ErrInvalidStagePolicyBackoff     = errors.New("stage policy backoff must be non-negative")
+	ErrInvalidStagePolicyTimeout     = errors.New("stage policy timeout must be non-negative")
 )
 
 func StageNotFound(name string) error {
