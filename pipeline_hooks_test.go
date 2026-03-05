@@ -317,3 +317,162 @@ func TestHooksTriggerErrorWithoutTriggerEnd(t *testing.T) {
 		t.Fatalf("expected no TriggerEnd on trigger error, got %d", got)
 	}
 }
+
+func TestHooksRunEndGetsExactReturnedErrorForMissingTriggerStage(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	tr := testTrigger[int]{
+		name:  "bad",
+		stage: "missing",
+	}
+
+	var runEndErr error
+	hooks := Hooks[int]{
+		RunEnd: func(ctx context.Context, meta RunMeta, err error) {
+			runEndErr = err
+		},
+	}
+
+	_, err := p.Run(context.Background(), nil, WithTriggers[int](tr), WithHooks[int](hooks))
+	if err == nil {
+		t.Fatal("expected missing trigger stage error")
+	}
+	if runEndErr == nil {
+		t.Fatal("expected RunEnd error to be set")
+	}
+	if err.Error() != runEndErr.Error() {
+		t.Fatalf("expected RunEnd error to match returned error: run=%q return=%q", runEndErr.Error(), err.Error())
+	}
+}
+
+func TestHooksRunEndGetsExactReturnedErrorForMissingSinkStage(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	sink := testSink[int]{
+		name:  "bad-sink",
+		stage: "missing",
+	}
+
+	var runEndErr error
+	hooks := Hooks[int]{
+		RunEnd: func(ctx context.Context, meta RunMeta, err error) {
+			runEndErr = err
+		},
+	}
+
+	_, err := p.Run(context.Background(), nil, WithSinks[int](sink), WithHooks[int](hooks))
+	if err == nil {
+		t.Fatal("expected missing sink stage error")
+	}
+	if runEndErr == nil {
+		t.Fatal("expected RunEnd error to be set")
+	}
+	if err.Error() != runEndErr.Error() {
+		t.Fatalf("expected RunEnd error to match returned error: run=%q return=%q", runEndErr.Error(), err.Error())
+	}
+}
+
+func TestHooksRunMetaEdgeCountIsTotalEdges(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "c", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "d", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("a", "c")
+	_ = p.Connect("b", "d")
+
+	var gotMeta RunMeta
+	hooks := Hooks[int]{
+		RunStart: func(ctx context.Context, meta RunMeta) {
+			gotMeta = meta
+		},
+	}
+
+	_, err := p.Run(context.Background(), map[string][]int{"a": {1}}, WithHooks[int](hooks))
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	if gotMeta.EdgeCount != 3 {
+		t.Fatalf("unexpected EdgeCount: got %d want %d", gotMeta.EdgeCount, 3)
+	}
+}
+
+func TestHooksConcurrencyUnderLoad(t *testing.T) {
+	const n = 1000
+
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 8,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in + 1}, nil
+		},
+	})
+	_ = p.AddStage(testStage[int]{
+		name:    "b",
+		workers: 8,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in * 2}, nil
+		},
+	})
+	_ = p.Connect("a", "b")
+
+	seeds := make([]int, n)
+	for i := range n {
+		seeds[i] = i
+	}
+
+	var (
+		stageStartCount  atomic.Int64
+		stageFinishCount atomic.Int64
+		runStartCount    atomic.Int64
+		runEndCount      atomic.Int64
+	)
+	hooks := Hooks[int]{
+		RunStart: func(ctx context.Context, meta RunMeta) {
+			runStartCount.Add(1)
+		},
+		RunEnd: func(ctx context.Context, meta RunMeta, err error) {
+			runEndCount.Add(1)
+		},
+		StageStart: func(ctx context.Context, e StageStartEvent[int]) {
+			stageStartCount.Add(1)
+		},
+		StageFinish: func(ctx context.Context, e StageFinishEvent[int]) {
+			stageFinishCount.Add(1)
+		},
+	}
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": seeds},
+		WithHooks[int](hooks),
+		WithBufferSize[int](32),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["a"]); got != n {
+		t.Fatalf("unexpected stage a count: got %d want %d", got, n)
+	}
+	if got := len(res["b"]); got != n {
+		t.Fatalf("unexpected stage b count: got %d want %d", got, n)
+	}
+
+	if got := runStartCount.Load(); got != 1 {
+		t.Fatalf("expected RunStart once, got %d", got)
+	}
+	if got := runEndCount.Load(); got != 1 {
+		t.Fatalf("expected RunEnd once, got %d", got)
+	}
+	if got := stageStartCount.Load(); got != int64(2*n) {
+		t.Fatalf("unexpected StageStart count: got %d want %d", got, 2*n)
+	}
+	if got := stageFinishCount.Load(); got != int64(2*n) {
+		t.Fatalf("unexpected StageFinish count: got %d want %d", got, 2*n)
+	}
+}

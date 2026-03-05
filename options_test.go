@@ -1,6 +1,7 @@
 package pipex
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -23,5 +24,38 @@ func TestWithSinkRetryNormalizesZeroBackoff(t *testing.T) {
 	}
 	if opts.SinkRetry.Backoff != time.Millisecond {
 		t.Fatalf("expected zero backoff normalized to 1ms, got %v", opts.SinkRetry.Backoff)
+	}
+}
+
+func TestDefaultHooksAreZeroValue(t *testing.T) {
+	opts := defaultOptions[int]()
+	if opts.Hooks.RunStart != nil {
+		t.Fatal("expected zero-value RunStart hook")
+	}
+	if opts.Hooks.RunEnd != nil {
+		t.Fatal("expected zero-value RunEnd hook")
+	}
+	if opts.Hooks.StageStart != nil {
+		t.Fatal("expected zero-value StageStart hook")
+	}
+}
+
+func TestWithHooksSetsHooks(t *testing.T) {
+	opts := defaultOptions[int]()
+	called := false
+	h := Hooks[int]{
+		RunStart: func(ctx context.Context, meta RunMeta) {
+			called = true
+		},
+	}
+
+	WithHooks[int](h)(opts)
+
+	if opts.Hooks.RunStart == nil {
+		t.Fatal("expected RunStart hook to be set")
+	}
+	opts.Hooks.RunStart(context.Background(), RunMeta{})
+	if !called {
+		t.Fatal("expected stored hook callback to be callable")
 	}
 }

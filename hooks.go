@@ -33,15 +33,14 @@ type Hooks[T any] struct {
 	SinkConsumeSuccess func(ctx context.Context, e SinkConsumeSuccessEvent[T])
 	SinkRetry          func(ctx context.Context, e SinkRetryEvent[T])
 	SinkExhausted      func(ctx context.Context, e SinkExhaustedEvent[T])
-	SinkError          func(ctx context.Context, e SinkErrorEvent[T])
 }
 
 func safeCall(fn func()) {
-  	defer func() {
-  		_ = recover()
-  	}()
-  	fn()
-  }
+	defer func() {
+		_ = recover()
+	}()
+	fn()
+}
 
 func emitRunStart[T any](ctx context.Context, h Hooks[T], meta RunMeta) {
 	if h.RunStart == nil {
@@ -61,7 +60,7 @@ func emitRunEnd[T any](ctx context.Context, h Hooks[T], meta RunMeta, e error) {
 type StageStartEvent[T any] struct {
 	RunID     string
 	Stage     string
-	Input      T
+	Input     T
 	StartedAt time.Time
 }
 
@@ -75,8 +74,8 @@ func emitStageStart[T any](ctx context.Context, h Hooks[T], e StageStartEvent[T]
 type StageFinishEvent[T any] struct {
 	RunID      string
 	Stage      string
-	Input       T
-	OutCount 	int
+	Input      T
+	OutCount   int
 	StartedAt  time.Time
 	FinishedAt time.Time
 	Duration   time.Duration
@@ -92,7 +91,7 @@ func emitStageFinish[T any](ctx context.Context, h Hooks[T], e StageFinishEvent[
 type StageErrorEvent[T any] struct {
 	RunID      string
 	Stage      string
-	Input       T
+	Input      T
 	StartedAt  time.Time
 	FinishedAt time.Time
 	Duration   time.Duration
@@ -223,21 +222,4 @@ func emitSinkExhausted[T any](ctx context.Context, h Hooks[T], e SinkExhaustedEv
 		return
 	}
 	safeCall(func() { h.SinkExhausted(ctx, e) })
-}
-
-type SinkErrorEvent[T any] struct {
-	RunID   string
-	Sink    string
-	Stage   string
-	Item    T
-	Err     error
-	Attempt int
-	At      time.Time
-}
-
-func emitSinkError[T any](ctx context.Context, h Hooks[T], e SinkErrorEvent[T]) {
-	if h.SinkError == nil {
-		return
-	}
-	safeCall(func() { h.SinkError(ctx, e) })
 }

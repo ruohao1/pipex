@@ -227,15 +227,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 						}
 
 						if ctx.Err() != nil {
-							emitSinkError(runCtx, runOpts.Hooks, SinkErrorEvent[T]{
-								RunID:   runID,
-								Sink:    sink.Name(),
-								Stage:   sink.Stage(),
-								Item:    item,
-								Err:     err,
-								Attempt: attempts,
-								At:      time.Now(),
-							})
 							recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
 							return
 						}
