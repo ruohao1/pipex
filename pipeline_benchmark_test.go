@@ -147,3 +147,40 @@ func BenchmarkRunStageWorkersFanout(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkRunStageRateLimitsFanout(b *testing.B) {
+	p := benchmarkPipelineForStageWorkersFanout()
+	seeds := benchmarkSeeds(512)
+
+	b.Run("without-stage-rate-limits", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := p.Run(context.Background(), seeds, WithBufferSize[int](256)); err != nil {
+				b.Fatalf("run failed: %v", err)
+			}
+		}
+	})
+
+	// Use high limits to isolate limiter overhead without introducing intentional throttling.
+	b.Run("with-stage-rate-limits", func(b *testing.B) {
+		limits := map[string]RateLimit{
+			"a": {RPS: 100000, Burst: 2048},
+			"b": {RPS: 100000, Burst: 2048},
+			"c": {RPS: 100000, Burst: 2048},
+			"d": {RPS: 100000, Burst: 2048},
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := p.Run(
+				context.Background(),
+				seeds,
+				WithBufferSize[int](256),
+				WithStageRateLimits[int](limits),
+			); err != nil {
+				b.Fatalf("run failed: %v", err)
+			}
+		}
+	})
+}

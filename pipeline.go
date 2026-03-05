@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	iruntime "github.com/ruohao1/pipex/internal/runtime"
 	"maps"
 	"slices"
 	"sync"
 	"time"
+
+	iruntime "github.com/ruohao1/pipex/internal/runtime"
+	"golang.org/x/time/rate"
 
 	"github.com/ruohao1/pipex/internal/graph"
 )
@@ -108,9 +110,28 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 	}
 
-	for stageName := range runOpts.StageWorkers {
+	for stageName, count := range runOpts.StageWorkers {
 		if _, ok := stages[stageName]; !ok {
 			retErr = fmt.Errorf("stage workers config: %w", StageNotFound(stageName))
+			return nil, retErr
+		}
+		if count <= 0 {
+			retErr = fmt.Errorf("stage %s: invalid worker count %d: %w", stageName, count, ErrInvalidWorkerCount)
+			return nil, retErr
+		}
+	}
+
+	for stageName, rate := range runOpts.StageRateLimits {
+		if _, ok := stages[stageName]; !ok {
+			retErr = fmt.Errorf("stage rate limits config: %w", StageNotFound(stageName))
+			return nil, retErr
+		}
+		if rate.RPS <= 0 {
+			retErr = fmt.Errorf("stage %s: invalid RPS %f: %w", stageName, rate.RPS, ErrInvalidRPS)
+			return nil, retErr
+		}
+		if rate.Burst < 1 {
+			retErr = fmt.Errorf("stage %s: invalid burst %d: %w", stageName, rate.Burst, ErrInvalidBurst)
 			return nil, retErr
 		}
 	}
@@ -138,6 +159,11 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	acceptedJobs := 0
 	reservedJobs := 0
 	seen := make(map[string]struct{})
+
+	limiters := map[string]*rate.Limiter{}
+	for stageName, cfg := range runOpts.StageRateLimits {
+		limiters[stageName] = rate.NewLimiter(rate.Limit(cfg.RPS), cfg.Burst)
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -393,6 +419,13 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				}
 
 				stage := stages[stageName]
+
+				if limiter, ok := limiters[stageName]; ok {
+					if err := limiter.Wait(runCtx); err != nil {
+						return fmt.Errorf("stage %s: rate limit wait: %w", stageName, err)
+					}
+				}
+
 				startTime := time.Now()
 				iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
 					RunID:     runID,

@@ -28,6 +28,9 @@ var (
 	ErrInvalidWorkerCount = errors.New("worker count must be greater than zero")
 	ErrInvalidQueueSize   = errors.New("queue size must be non-negative")
 	ErrNilJobFunc         = errors.New("job function cannot be nil")
+
+	ErrInvalidRPS   = errors.New("RPS must be greater than zero")
+	ErrInvalidBurst = errors.New("Burst must be greater than zero")
 )
 
 func StageNotFound(name string) error {

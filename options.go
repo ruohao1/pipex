@@ -15,6 +15,7 @@ type RunOptions[T any] struct {
 	SinkRetry            SinkRetryPolicy
 	ReturnPartialResults bool
 	StageWorkers         map[string]int
+	StageRateLimits      map[string]RateLimit
 }
 
 type CycleModeOptions[T any] struct {
@@ -27,6 +28,11 @@ type CycleModeOptions[T any] struct {
 type SinkRetryPolicy struct {
 	MaxRetries int           // -1 means infinite
 	Backoff    time.Duration // e.g. 10ms
+}
+
+type RateLimit struct {
+	RPS   float64
+	Burst int
 }
 
 type Option[T any] func(*RunOptions[T])
@@ -49,6 +55,7 @@ func defaultOptions[T any]() *RunOptions[T] {
 		},
 		ReturnPartialResults: false,
 		StageWorkers:         map[string]int{},
+		StageRateLimits:      map[string]RateLimit{},
 	}
 }
 
@@ -131,5 +138,13 @@ func WithStageWorkers[T any](stageWorkers map[string]int) Option[T] {
 		stageWorkersCopy := make(map[string]int, len(stageWorkers))
 		maps.Copy(stageWorkersCopy, stageWorkers)
 		opts.StageWorkers = stageWorkersCopy
+	}
+}
+
+func WithStageRateLimits[T any](stageRateLimits map[string]RateLimit) Option[T] {
+	return func(opts *RunOptions[T]) {
+		stageRateLimitsCopy := make(map[string]RateLimit, len(stageRateLimits))
+		maps.Copy(stageRateLimitsCopy, stageRateLimits)
+		opts.StageRateLimits = stageRateLimitsCopy
 	}
 }

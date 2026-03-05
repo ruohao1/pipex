@@ -39,3 +39,9 @@ res, err := p.Run(
 
 - `WithStageWorkers(...)` controls global stage-level concurrency.
 - It does not implement domain-specific policies like per-host throttling.
+
+## Interaction With Rate Limits
+
+- `WithStageWorkers(...)` controls how many items can run concurrently in a stage.
+- `WithStageRateLimits(...)` controls how quickly items are allowed to start processing in that stage.
+- Use both when you need to cap parallelism and smooth request throughput.

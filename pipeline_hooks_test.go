@@ -463,6 +463,64 @@ func TestHooksRunEndGetsExactReturnedErrorForUnknownStageWorkersOverride(t *test
 	}
 }
 
+func TestHooksRunEndGetsExactReturnedErrorForBadStageRateLimitsConfig(t *testing.T) {
+	t.Run("unknown stage", func(t *testing.T) {
+		p := NewPipeline[int]()
+		_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+		var runEndErr error
+		hooks := Hooks[int]{
+			RunEnd: func(ctx context.Context, meta RunMeta, err error) {
+				runEndErr = err
+			},
+		}
+
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": {1}},
+			WithStageRateLimits[int](map[string]RateLimit{"missing": {RPS: 10, Burst: 1}}),
+			WithHooks[int](hooks),
+		)
+		if err == nil {
+			t.Fatal("expected stage-rate-limits config error")
+		}
+		if runEndErr == nil {
+			t.Fatal("expected RunEnd error to be set")
+		}
+		if err.Error() != runEndErr.Error() {
+			t.Fatalf("expected RunEnd error to match returned error: run=%q return=%q", runEndErr.Error(), err.Error())
+		}
+	})
+
+	t.Run("invalid rps", func(t *testing.T) {
+		p := NewPipeline[int]()
+		_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+		var runEndErr error
+		hooks := Hooks[int]{
+			RunEnd: func(ctx context.Context, meta RunMeta, err error) {
+				runEndErr = err
+			},
+		}
+
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": {1}},
+			WithStageRateLimits[int](map[string]RateLimit{"a": {RPS: 0, Burst: 1}}),
+			WithHooks[int](hooks),
+		)
+		if err == nil {
+			t.Fatal("expected stage-rate-limits config error")
+		}
+		if runEndErr == nil {
+			t.Fatal("expected RunEnd error to be set")
+		}
+		if err.Error() != runEndErr.Error() {
+			t.Fatalf("expected RunEnd error to match returned error: run=%q return=%q", runEndErr.Error(), err.Error())
+		}
+	})
+}
+
 func TestHooksConcurrencyUnderLoad(t *testing.T) {
 	const n = 1000
 

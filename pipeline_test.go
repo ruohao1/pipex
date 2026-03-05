@@ -369,6 +369,124 @@ func TestRunStageWorkersLastOptionReplacesEarlierMap(t *testing.T) {
 	}
 }
 
+func TestRunStageRateLimitsUnknownStageRejected(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStageRateLimits[int](map[string]RateLimit{"missing": {RPS: 10, Burst: 1}}),
+	)
+	if !errors.Is(err, ErrStageNotFound) {
+		t.Fatalf("expected ErrStageNotFound for unknown stage rate-limit override, got %v", err)
+	}
+}
+
+func TestRunStageRateLimitsInvalidRPSRejected(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStageRateLimits[int](map[string]RateLimit{"a": {RPS: 0, Burst: 1}}),
+	)
+	if !errors.Is(err, ErrInvalidRPS) {
+		t.Fatalf("expected ErrInvalidRPS for invalid stage rate-limit override, got %v", err)
+	}
+}
+
+func TestRunStageRateLimitsInvalidBurstRejected(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStageRateLimits[int](map[string]RateLimit{"a": {RPS: 10, Burst: 0}}),
+	)
+	if !errors.Is(err, ErrInvalidBurst) {
+		t.Fatalf("expected ErrInvalidBurst for invalid stage rate-limit override, got %v", err)
+	}
+}
+
+func TestRunStageRateLimitsLastOptionReplacesEarlierMap(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2}},
+		WithStageRateLimits[int](map[string]RateLimit{"missing": {RPS: 10, Burst: 1}}),
+		WithStageRateLimits[int](map[string]RateLimit{"a": {RPS: 1000, Burst: 1}}),
+	)
+	if err != nil {
+		t.Fatalf("expected final stage-rate-limits map to replace earlier one, got %v", err)
+	}
+	if got := len(res["a"]); got != 2 {
+		t.Fatalf("unexpected outputs with replacement semantics: got %d want %d", got, 2)
+	}
+}
+
+func TestRunStageRateLimitWaitHonorsContextCancellation(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in}, nil
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	_, err := p.Run(
+		ctx,
+		map[string][]int{"a": {1, 2}},
+		WithStageRateLimits[int](map[string]RateLimit{"a": {RPS: 0.5, Burst: 1}}),
+	)
+	if err == nil {
+		t.Fatal("expected limiter wait failure under tight context deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, context.Canceled) &&
+		!strings.Contains(err.Error(), "would exceed context deadline") {
+		t.Fatalf("expected context/limiter deadline error while waiting on stage limiter, got %v", err)
+	}
+}
+
+func TestRunStageRateLimitsRepeatedCancellationStability(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in}, nil
+		},
+	})
+
+	for i := 0; i < 20; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		_, err := p.Run(
+			ctx,
+			map[string][]int{"a": {1, 2}},
+			WithStageRateLimits[int](map[string]RateLimit{"a": {RPS: 0.5, Burst: 1}}),
+		)
+		cancel()
+
+		if err == nil {
+			t.Fatalf("iteration %d: expected limiter wait failure under tight context deadline", i)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) &&
+			!errors.Is(err, context.Canceled) &&
+			!strings.Contains(err.Error(), "would exceed context deadline") {
+			t.Fatalf("iteration %d: expected context/limiter deadline error, got %v", i, err)
+		}
+	}
+}
+
 func TestRunFailFastWithQueuedJobsDoesNotHang(t *testing.T) {
 	p := NewPipeline[int]()
 	wantErr := errors.New("boom")

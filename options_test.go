@@ -115,3 +115,39 @@ func TestWithStageWorkersLastCallWins(t *testing.T) {
 		t.Fatalf("expected earlier map entries to be replaced, got %v", opts.StageWorkers)
 	}
 }
+
+func TestWithStageRateLimitsSetsCopiedMap(t *testing.T) {
+	opts := defaultOptions[int]()
+	in := map[string]RateLimit{"a": {RPS: 10, Burst: 2}}
+
+	WithStageRateLimits[int](in)(opts)
+
+	if got := opts.StageRateLimits["a"]; got != (RateLimit{RPS: 10, Burst: 2}) {
+		t.Fatalf("unexpected stage rate limit override: got %+v", got)
+	}
+
+	in["a"] = RateLimit{RPS: 99, Burst: 9}
+	if got := opts.StageRateLimits["a"]; got != (RateLimit{RPS: 10, Burst: 2}) {
+		t.Fatalf("expected option map copy to be immutable from caller changes, got %+v", got)
+	}
+	if maps.Equal(opts.StageRateLimits, in) {
+		t.Fatalf("expected copied map to diverge after caller mutation, got opts=%v in=%v", opts.StageRateLimits, in)
+	}
+}
+
+func TestWithStageRateLimitsLastCallWins(t *testing.T) {
+	opts := defaultOptions[int]()
+
+	WithStageRateLimits[int](map[string]RateLimit{"a": {RPS: 10, Burst: 2}, "b": {RPS: 5, Burst: 1}})(opts)
+	WithStageRateLimits[int](map[string]RateLimit{"c": {RPS: 2.5, Burst: 3}})(opts)
+
+	if len(opts.StageRateLimits) != 1 {
+		t.Fatalf("expected replacement semantics, got %v", opts.StageRateLimits)
+	}
+	if got := opts.StageRateLimits["c"]; got != (RateLimit{RPS: 2.5, Burst: 3}) {
+		t.Fatalf("expected final override map to win, got c=%+v map=%v", got, opts.StageRateLimits)
+	}
+	if _, ok := opts.StageRateLimits["a"]; ok {
+		t.Fatalf("expected earlier map entries to be replaced, got %v", opts.StageRateLimits)
+	}
+}
