@@ -151,3 +151,31 @@ func TestWithStageRateLimitsLastCallWins(t *testing.T) {
 		t.Fatalf("expected earlier map entries to be replaced, got %v", opts.StageRateLimits)
 	}
 }
+
+func TestWithDedupRulesAppends(t *testing.T) {
+	opts := defaultOptions[int]()
+	r1 := DedupRule[int]{
+		Name:  "r1",
+		Scope: DedupScopeGlobal,
+		Key: func(v int) string {
+			return "k1"
+		},
+	}
+	r2 := DedupRule[int]{
+		Name:  "r2",
+		Scope: DedupScopeStage("a"),
+		Key: func(v int) string {
+			return "k2"
+		},
+	}
+
+	WithDedupRules[int](r1)(opts)
+	WithDedupRules[int](r2)(opts)
+
+	if got := len(opts.DedupRules); got != 2 {
+		t.Fatalf("expected two dedup rules, got %d", got)
+	}
+	if opts.DedupRules[0].Name != "r1" || opts.DedupRules[1].Name != "r2" {
+		t.Fatalf("unexpected dedup rule order: %+v", opts.DedupRules)
+	}
+}

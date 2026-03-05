@@ -487,6 +487,118 @@ func TestRunStageRateLimitsRepeatedCancellationStability(t *testing.T) {
 	}
 }
 
+func TestRunDedupRuleStageScopeAppliesOnlyToTargetStage(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "c", workers: 1})
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{
+			"b": {1, 1, 2},
+			"c": {1, 1, 2},
+		},
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "b-only",
+			Scope: DedupScopeStage("b"),
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["b"]); got != 2 {
+		t.Fatalf("expected dedup on stage b only, got b=%v", res["b"])
+	}
+	if got := len(res["c"]); got != 3 {
+		t.Fatalf("expected no dedup on stage c for stage-scoped rule, got c=%v", res["c"])
+	}
+}
+
+func TestRunDedupRuleGlobalAppliesToAllStages(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "c", workers: 1})
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{
+			"b": {1, 1, 2},
+			"c": {1, 1, 2},
+		},
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "all-stages",
+			Scope: DedupScopeGlobal,
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["b"]); got != 2 {
+		t.Fatalf("expected dedup on stage b for global rule, got b=%v", res["b"])
+	}
+	if got := len(res["c"]); got != 2 {
+		t.Fatalf("expected dedup on stage c for global rule, got c=%v", res["c"])
+	}
+}
+
+func TestRunDedupRollbackOnEnqueueFailureDoesNotLeakKey(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			// Keep job running so downstream enqueue attempts happen after context timeout.
+			time.Sleep(25 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+
+	// Run 1: timeout after dedup insert but before enqueue send succeeds.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel1()
+	_, err := p.Run(
+		ctx1,
+		map[string][]int{"a": {1}},
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "b-host",
+			Scope: DedupScopeStage("b"),
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
+	)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected timeout/cancel in run1, got %v", err)
+	}
+
+	// Run 2: same item should not be falsely dropped by leaked dedup key from run1.
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "b-host",
+			Scope: DedupScopeStage("b"),
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run2 error: %v", err)
+	}
+	if got := len(res["b"]); got != 1 {
+		t.Fatalf("expected downstream enqueue to succeed in run2 (no leaked dedup key), got b=%v", res["b"])
+	}
+}
+
 func TestRunFailFastWithQueuedJobsDoesNotHang(t *testing.T) {
 	p := NewPipeline[int]()
 	wantErr := errors.New("boom")

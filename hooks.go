@@ -39,6 +39,8 @@ type Hooks[T any] struct {
 	CycleHopLimitDrop    func(ctx context.Context, e CycleHopLimitDropEvent[T])
 	CycleDedupDrop       func(ctx context.Context, e CycleDedupDropEvent[T])
 	CycleMaxJobsExceeded func(ctx context.Context, e CycleMaxJobsExceededEvent[T])
+
+	DedupDrop func(ctx context.Context, e DedupDropEvent[T])
 }
 
 // Stage events
@@ -170,3 +172,13 @@ type CycleMaxJobsExceededEvent[T any] struct {
 	MaxJobs      int
 	At           time.Time
 }
+
+// DedupDropEvent is emitted when an enqueue is dropped due to a deduplication rule, outside of cycle-mode.
+type DedupDropEvent[T any] struct {
+	RunID string
+	Scope DedupScope
+	Key   string
+	Item  T
+	At    time.Time
+}
+

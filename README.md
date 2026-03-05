@@ -9,6 +9,7 @@ A library to help you create pipelines in Golang
 - Cycle mode: `docs/cycle-mode.md`
 - Stage workers: `docs/stage-workers.md`
 - Rate limits: `docs/rate-limits.md`
+- Dedup rules: `docs/dedup.md`
 
 ## Run Options
 
@@ -23,6 +24,7 @@ A library to help you create pipelines in Golang
 - `WithPartialResults(v)`: when `true`, return currently collected results together with an error.
 - `WithStageWorkers(map[string]int)`: per-run per-stage worker overrides (must reference existing stages; each value must be `> 0`).
 - `WithStageRateLimits(map[string]RateLimit)`: per-run per-stage rate limits (`RPS > 0`, `Burst >= 1`).
+- `WithDedupRules(...)`: per-run dedup rules (`global` or `stage:<name>` scope).
 
 Defaults:
 
@@ -38,6 +40,7 @@ Defaults:
 - Trigger and sink errors are also joined into the returned error.
 - Invalid `WithStageWorkers(...)` configuration (unknown stage or non-positive worker count) returns a run error before processing starts.
 - Invalid `WithStageRateLimits(...)` configuration (unknown stage, non-positive `RPS`, or `Burst < 1`) returns a run error before processing starts.
+- Invalid `WithDedupRules(...)` configuration (empty name/scope, nil key, invalid scope format, or unknown stage in `stage:<name>`) returns a run error before processing starts.
 - When `FailFast=true`, the first stage error cancels the run, and the stage error is returned (not `context.Canceled`).
 - If there are no stage errors but the context is canceled or times out, `Run` returns the context error.
 - By default, errors return `nil` results.

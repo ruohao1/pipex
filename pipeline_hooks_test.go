@@ -521,6 +521,47 @@ func TestHooksRunEndGetsExactReturnedErrorForBadStageRateLimitsConfig(t *testing
 	})
 }
 
+func TestHooksDedupDropPayload(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	var (
+		dropCount atomic.Int64
+		dropEvt   DedupDropEvent[int]
+	)
+	hooks := Hooks[int]{
+		DedupDrop: func(ctx context.Context, e DedupDropEvent[int]) {
+			dropCount.Add(1)
+			dropEvt = e
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 1}},
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "global-dedup",
+			Scope: DedupScopeGlobal,
+			Key: func(v int) string {
+				return "k"
+			},
+		}),
+		WithHooks[int](hooks),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := dropCount.Load(); got != 1 {
+		t.Fatalf("expected one DedupDrop event, got %d", got)
+	}
+	if dropEvt.Scope != DedupScopeGlobal {
+		t.Fatalf("unexpected dedup scope: got %q want %q", dropEvt.Scope, DedupScopeGlobal)
+	}
+	if dropEvt.Key != "a\x00k" {
+		t.Fatalf("unexpected dedup key: got %q want %q", dropEvt.Key, "a\x00k")
+	}
+}
+
 func TestHooksConcurrencyUnderLoad(t *testing.T) {
 	const n = 1000
 

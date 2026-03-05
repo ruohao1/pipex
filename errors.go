@@ -31,6 +31,10 @@ var (
 
 	ErrInvalidRPS   = errors.New("RPS must be greater than zero")
 	ErrInvalidBurst = errors.New("Burst must be greater than zero")
+
+	ErrInvalidDedupRuleName  = errors.New("dedup rule name cannot be empty")
+	ErrInvalidDedupRuleScope = errors.New("dedup rule scope cannot be empty")
+	ErrInvalidDedupRuleKey   = errors.New("dedup rule key function cannot be nil")
 )
 
 func StageNotFound(name string) error {

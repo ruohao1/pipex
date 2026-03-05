@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,14 @@ func NewPipeline[T any]() *Pipeline[T] {
 		stages: make(map[string]Stage[T]),
 		edges:  make(map[string][]string),
 	}
+}
+func parseStageScope(s DedupScope) (stage string, ok bool) {
+	const p = "stage:"
+	v := string(s)
+	if strings.HasPrefix(v, p) && len(v) > len(p) {
+		return v[len(p):], true
+	}
+	return "", false
 }
 
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
@@ -151,6 +160,41 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	jobsByStage := make(map[string]chan Job, len(stages))
 	poolsByStage := make(map[string]*Pool, len(stages))
 	sinksByStage := make(map[string][]chan T)
+	dedupRulesByStage := make(map[string][]DedupRule[T])
+
+	for _, rule := range runOpts.DedupRules {
+		if rule.Name == "" {
+			retErr = ErrInvalidDedupRuleName
+			return nil, retErr
+		}
+		if rule.Key == nil {
+			retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleKey)
+			return nil, retErr
+		}
+		if rule.Scope == "" {
+			retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleScope)
+			return nil, retErr
+		}
+		stageScope, isStageScope := parseStageScope(rule.Scope)
+		if !isStageScope && rule.Scope != DedupScopeGlobal {
+			retErr = fmt.Errorf("dedup rule %s: invalid scope %s: %w", rule.Name, rule.Scope, ErrInvalidDedupRuleScope)
+			return nil, retErr
+		}
+
+		if isStageScope {
+			if _, ok := stages[stageScope]; !ok {
+				retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, StageNotFound(stageScope))
+				return nil, retErr
+			}
+			dedupRulesByStage[stageScope] = append(dedupRulesByStage[stageScope], rule)
+		}
+
+		if !isStageScope || rule.Scope == DedupScopeGlobal {
+			for stageName := range stages {
+				dedupRulesByStage[stageName] = append(dedupRulesByStage[stageName], rule)
+			}
+		}
+	}
 
 	var errsMu sync.Mutex
 	var runErrs []error
@@ -159,6 +203,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	acceptedJobs := 0
 	reservedJobs := 0
 	seen := make(map[string]struct{})
+	var seenMu sync.Mutex
 
 	limiters := map[string]*rate.Limiter{}
 	for stageName, cfg := range runOpts.StageRateLimits {
@@ -335,9 +380,52 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		var dedupInserted bool
-		var dedupMapKey string
+		dedupInsertedKeys := make([]string, 0, 4)
 		var reservationTaken bool
+		var key string
+		rollbackDedup := func() {
+			if len(dedupInsertedKeys) == 0 {
+				return
+			}
+			seenMu.Lock()
+			for _, k := range dedupInsertedKeys {
+				delete(seen, k)
+			}
+			seenMu.Unlock()
+		}
+
+		if dedupRules, ok := dedupRulesByStage[stageName]; ok {
+			for _, rule := range dedupRules {
+				dedupKeyValue, derr := func() (key string, err error) {
+					defer func() {
+						if r := recover(); r != nil {
+							err = fmt.Errorf("dedup key panic: %v", r)
+						}
+					}()
+					return rule.Key(in), nil
+				}()
+				if derr != nil {
+					return derr
+				}
+				key = stageName + "\x00" + dedupKeyValue
+				seenMu.Lock()
+				if _, exists := seen[key]; exists {
+					seenMu.Unlock()
+					// TODO: add a hook for dedup drops from dedup rules
+					iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
+						RunID: runID,
+						Item:  in,
+						Key:   key,
+						At:    time.Now(),
+						Scope: rule.Scope,
+					})
+					return nil
+				}
+				seen[key] = struct{}{}
+				dedupInsertedKeys = append(dedupInsertedKeys, key)
+				seenMu.Unlock()
+			}
+		}
 		if runOpts.CycleMode.Enabled {
 			var key string
 
@@ -372,7 +460,9 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				return nil
 			}
 			if runOpts.CycleMode.DedupKey != nil {
+				seenMu.Lock()
 				if _, exists := seen[key]; exists {
+					seenMu.Unlock()
 					frontierMu.Unlock()
 					iruntime.Call2(runOpts.Hooks.CycleDedupDrop, runCtx, CycleDedupDropEvent[T]{
 						RunID: runID,
@@ -385,13 +475,12 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					return nil
 				}
 				seen[key] = struct{}{}
-				dedupInserted = true
-				dedupMapKey = key
+
+				seenMu.Unlock()
+				dedupInsertedKeys = append(dedupInsertedKeys, key)
 			}
 			if acceptedJobs+reservedJobs >= runOpts.CycleMode.MaxJobs {
-				if dedupInserted {
-					delete(seen, dedupMapKey)
-				}
+				rollbackDedup()
 				frontierMu.Unlock()
 				iruntime.Call2(runOpts.Hooks.CycleMaxJobsExceeded, runCtx, CycleMaxJobsExceededEvent[T]{
 					RunID:        runID,
@@ -491,9 +580,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			if reservationTaken {
 				reservedJobs--
 			}
-			if dedupInserted {
-				delete(seen, dedupMapKey)
-			}
+			rollbackDedup()
 			frontierMu.Unlock()
 			return ctx.Err()
 

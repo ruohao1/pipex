@@ -16,6 +16,7 @@ type RunOptions[T any] struct {
 	ReturnPartialResults bool
 	StageWorkers         map[string]int
 	StageRateLimits      map[string]RateLimit
+	DedupRules           []DedupRule[T]
 }
 
 type CycleModeOptions[T any] struct {
@@ -33,6 +34,22 @@ type SinkRetryPolicy struct {
 type RateLimit struct {
 	RPS   float64
 	Burst int
+}
+
+type DedupScope string
+
+const (
+	DedupScopeGlobal DedupScope = "global"
+)
+func DedupScopeStage(stageName string) DedupScope {
+	return DedupScope("stage:" + stageName)
+}
+
+type DedupRule[T any] struct {
+	Name  string
+	Scope DedupScope
+	Key   func(T) string
+	// TTL   time.Duration
 }
 
 type Option[T any] func(*RunOptions[T])
@@ -76,18 +93,12 @@ func WithFailFast[T any](failFast bool) Option[T] {
 
 func WithTriggers[T any](triggers ...Trigger[T]) Option[T] {
 	return func(opts *RunOptions[T]) {
-		if len(triggers) == 0 {
-			return
-		}
 		opts.Triggers = append(opts.Triggers, triggers...)
 	}
 }
 
 func WithSinks[T any](sinks ...Sink[T]) Option[T] {
 	return func(opts *RunOptions[T]) {
-		if len(sinks) == 0 {
-			return
-		}
 		opts.Sinks = append(opts.Sinks, sinks...)
 	}
 }
@@ -146,5 +157,11 @@ func WithStageRateLimits[T any](stageRateLimits map[string]RateLimit) Option[T] 
 		stageRateLimitsCopy := make(map[string]RateLimit, len(stageRateLimits))
 		maps.Copy(stageRateLimitsCopy, stageRateLimits)
 		opts.StageRateLimits = stageRateLimitsCopy
+	}
+}
+
+func WithDedupRules[T any](rules ...DedupRule[T]) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.DedupRules = append(opts.DedupRules, rules...)
 	}
 }
