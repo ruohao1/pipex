@@ -56,7 +56,7 @@ func main() {
 	res1, err := p1.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		pipex.WithCycleMode[int](4, 100, nil),
+		pipex.WithCycleMode[int](4, 100),
 	)
 	if err != nil {
 		panic(err)
@@ -72,14 +72,17 @@ func main() {
 	res2, err := p2.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		pipex.WithCycleMode[int](
-			10,
-			100,
-			func(v int) string {
-				if v%2 == 0 {
-					return "even"
-				}
-				return "odd"
+		pipex.WithCycleMode[int](10, 100),
+		pipex.WithDedupRules[int](
+			pipex.DedupRule[int]{
+				Name:  "parity",
+				Scope: pipex.DedupScopeGlobal,
+				Key: func(v int) string {
+					if v%2 == 0 {
+						return "even"
+					}
+					return "odd"
+				},
 			},
 		),
 	)

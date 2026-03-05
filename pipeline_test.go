@@ -650,7 +650,7 @@ func TestRunDedupRollbackOnMaxHopsDropDoesNotLeakKey(t *testing.T) {
 	res, err := p.Run(
 		context.Background(),
 		map[string][]int{"s": {1}},
-		WithCycleMode[int](2, 100, nil),
+		WithCycleMode[int](2, 100),
 		WithDedupRules[int](DedupRule[int]{
 			Name:  "t-only",
 			Scope: DedupScopeStage("t"),
@@ -1522,7 +1522,7 @@ func TestRunCycleModeAllowsCycleWithMaxHops(t *testing.T) {
 	res, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		WithCycleMode[int](2, 100, nil),
+		WithCycleMode[int](2, 100),
 	)
 	if err != nil {
 		t.Fatalf("unexpected run error: %v", err)
@@ -1545,7 +1545,7 @@ func TestRunCycleModeMaxJobsExceeded(t *testing.T) {
 	_, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		WithCycleMode[int](-1, 2, nil),
+		WithCycleMode[int](-1, 2),
 		WithFailFast[int](true),
 	)
 	if !errors.Is(err, ErrCycleModeMaxJobsExceeded) {
@@ -1563,7 +1563,14 @@ func TestRunCycleModeDedupStopsRevisit(t *testing.T) {
 	res, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) }),
+		WithCycleMode[int](-1, 100),
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "cycle-item",
+			Scope: DedupScopeGlobal,
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
 	)
 	if err != nil {
 		t.Fatalf("unexpected run error: %v", err)
@@ -1586,7 +1593,7 @@ func TestRunCycleModeAndDedupRulesNoCrossRuleCollision(t *testing.T) {
 	res, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) }),
+		WithCycleMode[int](-1, 100),
 		WithDedupRules[int](DedupRule[int]{
 			Name:  "global-dedup",
 			Scope: DedupScopeGlobal,
@@ -1606,7 +1613,7 @@ func TestRunCycleModeAndDedupRulesNoCrossRuleCollision(t *testing.T) {
 	}
 }
 
-func TestRunCycleModeDedupKeyPanicReturnsError(t *testing.T) {
+func TestRunCycleModeDedupRuleKeyPanicReturnsError(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
 	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
@@ -1618,8 +1625,13 @@ func TestRunCycleModeDedupKeyPanicReturnsError(t *testing.T) {
 		_, err := p.Run(
 			context.Background(),
 			map[string][]int{"a": {1}},
-			WithCycleMode[int](-1, 100, func(v int) string {
-				panic("dedup panic")
+			WithCycleMode[int](-1, 100),
+			WithDedupRules[int](DedupRule[int]{
+				Name:  "panic-key",
+				Scope: DedupScopeGlobal,
+				Key: func(v int) string {
+					panic("dedup panic")
+				},
 			}),
 		)
 		done <- err
@@ -1630,7 +1642,7 @@ func TestRunCycleModeDedupKeyPanicReturnsError(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected dedup key panic to surface as run error")
 		}
-		if got := err.Error(); !strings.Contains(got, "cycle dedup key panic") {
+		if got := err.Error(); !strings.Contains(got, "dedup key panic") {
 			t.Fatalf("expected dedup panic error, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
@@ -1666,7 +1678,7 @@ func TestRunCycleModeMaxJobsBoundUnderConcurrentEnqueue(t *testing.T) {
 		res, err := p.Run(
 			context.Background(),
 			map[string][]int{"a": {1}},
-			WithCycleMode[int](-1, maxJobs, nil),
+			WithCycleMode[int](-1, maxJobs),
 			WithFailFast[int](true),
 			WithPartialResults[int](true),
 		)

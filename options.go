@@ -24,10 +24,6 @@ type CycleModeOptions[T any] struct {
 	Enabled bool
 	MaxHops int // -1 means unlimited
 	MaxJobs int // must be > 0 when enabled
-	// Deprecated: use WithDedupRules(...) for new dedup configuration.
-	// This field remains supported for backward compatibility and is internally
-	// translated into runtime dedup rules.
-	DedupKey func(T) string // nil means dedup disabled
 }
 
 type SinkRetryPolicy struct {
@@ -123,17 +119,12 @@ func WithHooks[T any](hooks Hooks[T]) Option[T] {
 }
 
 // WithCycleMode configures cycle traversal guardrails.
-//
-// Deprecated: the dedupKey parameter is deprecated; configure dedup using
-// WithDedupRules(...) instead. dedupKey remains supported for backward
-// compatibility and uses the same runtime dedup path internally.
-func WithCycleMode[T any](maxHops, maxJobs int, dedupKey func(T) string) Option[T] {
+func WithCycleMode[T any](maxHops, maxJobs int) Option[T] {
 	return func(opts *RunOptions[T]) {
 		opts.CycleMode = CycleModeOptions[T]{
-			Enabled:  true,
-			MaxHops:  maxHops,
-			MaxJobs:  maxJobs,
-			DedupKey: dedupKey,
+			Enabled: true,
+			MaxHops: maxHops,
+			MaxJobs: maxJobs,
 		}
 	}
 }

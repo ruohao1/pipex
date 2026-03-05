@@ -40,7 +40,7 @@ func TestCycleHookHopLimitDropPayload(t *testing.T) {
 	_, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		WithCycleMode[int](0, 100, nil),
+		WithCycleMode[int](0, 100),
 		WithHooks[int](hooks),
 	)
 	if err != nil {
@@ -66,63 +66,6 @@ func TestCycleHookHopLimitDropPayload(t *testing.T) {
 	}
 }
 
-func TestCycleHookDedupDropPayload(t *testing.T) {
-	p := NewPipeline[int]()
-	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
-	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
-	_ = p.Connect("a", "b")
-	_ = p.Connect("b", "a")
-
-	var (
-		mu       sync.Mutex
-		runID    string
-		dropSeen bool
-		dropEvt  CycleDedupDropEvent[int]
-	)
-
-	hooks := Hooks[int]{
-		RunStart: func(ctx context.Context, meta RunMeta) {
-			mu.Lock()
-			runID = meta.RunID
-			mu.Unlock()
-		},
-		CycleDedupDrop: func(ctx context.Context, e CycleDedupDropEvent[int]) {
-			mu.Lock()
-			dropSeen = true
-			dropEvt = e
-			mu.Unlock()
-		},
-	}
-
-	_, err := p.Run(
-		context.Background(),
-		map[string][]int{"a": {1}},
-		WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) }),
-		WithHooks[int](hooks),
-	)
-	if err != nil {
-		t.Fatalf("unexpected run error: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if !dropSeen {
-		t.Fatal("expected CycleDedupDrop hook event")
-	}
-	if dropEvt.RunID == "" || dropEvt.RunID != runID {
-		t.Fatalf("unexpected RunID: event=%q run=%q", dropEvt.RunID, runID)
-	}
-	if dropEvt.Stage != "a" {
-		t.Fatalf("unexpected dedup stage: got %q want %q", dropEvt.Stage, "a")
-	}
-	if dropEvt.Item != 1 {
-		t.Fatalf("unexpected dedup item: got %d want %d", dropEvt.Item, 1)
-	}
-	if dropEvt.Key != "a\x001" {
-		t.Fatalf("unexpected dedup key: got %q want %q", dropEvt.Key, "a\x001")
-	}
-}
-
 func TestCycleModeWithDedupRulesEmitsSingleDedupHookPath(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
@@ -130,17 +73,11 @@ func TestCycleModeWithDedupRulesEmitsSingleDedupHookPath(t *testing.T) {
 	_ = p.Connect("a", "b")
 	_ = p.Connect("b", "a")
 
-	var (
-		dedupDrops      atomic.Int64
-		cycleDedupDrops atomic.Int64
-	)
+	var dedupDrops atomic.Int64
 
 	hooks := Hooks[int]{
 		DedupDrop: func(ctx context.Context, e DedupDropEvent[int]) {
 			dedupDrops.Add(1)
-		},
-		CycleDedupDrop: func(ctx context.Context, e CycleDedupDropEvent[int]) {
-			cycleDedupDrops.Add(1)
 		},
 	}
 
@@ -148,7 +85,7 @@ func TestCycleModeWithDedupRulesEmitsSingleDedupHookPath(t *testing.T) {
 		context.Background(),
 		map[string][]int{"a": {1}},
 		WithHooks[int](hooks),
-		WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) }),
+		WithCycleMode[int](-1, 100),
 		WithDedupRules[int](DedupRule[int]{
 			Name:  "global-dedup",
 			Scope: DedupScopeGlobal,
@@ -162,9 +99,6 @@ func TestCycleModeWithDedupRulesEmitsSingleDedupHookPath(t *testing.T) {
 	}
 	if dedupDrops.Load() == 0 {
 		t.Fatal("expected dedup drops to be reported via DedupDrop when explicit dedup rule is configured")
-	}
-	if cycleDedupDrops.Load() != 0 {
-		t.Fatalf("expected no CycleDedupDrop events with explicit dedup rules, got %d", cycleDedupDrops.Load())
 	}
 }
 
@@ -199,7 +133,7 @@ func TestCycleHookMaxJobsExceededPayload(t *testing.T) {
 	_, err := p.Run(
 		context.Background(),
 		map[string][]int{"a": {1}},
-		WithCycleMode[int](-1, 1, nil),
+		WithCycleMode[int](-1, 1),
 		WithFailFast[int](true),
 		WithHooks[int](hooks),
 	)
@@ -271,7 +205,7 @@ func TestCycleModeHooksWithTriggersConcurrent(t *testing.T) {
 		RunEnd: func(ctx context.Context, meta RunMeta, err error) {
 			runEnd.Add(1)
 		},
-		CycleDedupDrop: func(ctx context.Context, e CycleDedupDropEvent[int]) {
+		DedupDrop: func(ctx context.Context, e DedupDropEvent[int]) {
 			dedup.Add(1)
 		},
 		CycleHopLimitDrop: func(ctx context.Context, e CycleHopLimitDropEvent[int]) {
@@ -287,7 +221,14 @@ func TestCycleModeHooksWithTriggersConcurrent(t *testing.T) {
 		map[string][]int{"a": {1, 2, 3}},
 		WithTriggers[int](tr),
 		WithHooks[int](hooks),
-		WithCycleMode[int](4, 1000, func(v int) string { return fmt.Sprintf("%d", v) }),
+		WithCycleMode[int](4, 1000),
+		WithDedupRules[int](DedupRule[int]{
+			Name:  "global",
+			Scope: DedupScopeGlobal,
+			Key: func(v int) string {
+				return fmt.Sprintf("%d", v)
+			},
+		}),
 		WithPartialResults[int](true),
 	)
 	if err != nil && !errors.Is(err, ErrCycleModeMaxJobsExceeded) && !errors.Is(err, context.DeadlineExceeded) {
