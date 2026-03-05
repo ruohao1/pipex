@@ -426,9 +426,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					}()
 					return rule.Key(in), nil
 				}()
-				if derr != nil {
-					return derr
-				}
+					if derr != nil {
+						rollbackDedup()
+						return derr
+					}
 				key = stageName + "\x00" + dedupKeyValue
 				dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
 				seenMu.Lock()
@@ -461,10 +462,11 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		if runOpts.CycleMode.Enabled {
 			at := time.Now()
 			frontierMu.Lock()
-			if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
-				frontierMu.Unlock()
-				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
-					RunID:   runID,
+				if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
+					rollbackDedup()
+					frontierMu.Unlock()
+					iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
+						RunID:   runID,
 					Stage:   stageName,
 					Item:    in,
 					Hops:    hops,
