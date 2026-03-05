@@ -7,6 +7,7 @@ A library to help you create pipelines in Golang
 - Triggers: `docs/triggers.md`
 - Sinks: `docs/sinks.md`
 - Cycle mode: `docs/cycle-mode.md`
+- Stage workers: `docs/stage-workers.md`
 
 ## Run Options
 
@@ -19,6 +20,7 @@ A library to help you create pipelines in Golang
 - `WithHooks(...)`: register runtime observability callbacks.
 - `WithSinkRetry(maxRetries, backoff)`: configure sink retry policy.
 - `WithPartialResults(v)`: when `true`, return currently collected results together with an error.
+- `WithStageWorkers(map[string]int)`: per-run per-stage worker overrides (must reference existing stages; each value must be `> 0`).
 
 Defaults:
 
@@ -32,6 +34,7 @@ Defaults:
 - Pipeline config/graph validation errors are returned before execution starts.
 - If stage processing errors occur, `Run` returns a joined error (`errors.Join(...)`).
 - Trigger and sink errors are also joined into the returned error.
+- Invalid `WithStageWorkers(...)` configuration (unknown stage or non-positive worker count) returns a run error before processing starts.
 - When `FailFast=true`, the first stage error cancels the run, and the stage error is returned (not `context.Canceled`).
 - If there are no stage errors but the context is canceled or times out, `Run` returns the context error.
 - By default, errors return `nil` results.
@@ -98,6 +101,18 @@ See detailed contract: `docs/hooks.md`.
 - Sinks with persistent failures will eventually disable themselves after retry exhaustion unless `MaxRetries=-1`.
 - Using `MaxRetries=-1` means infinite retry and can keep a run alive if the sink never succeeds.
 - If you need progress on failure/cancellation, enable `WithPartialResults(true)`.
+- Treat stage definitions as immutable after `AddStage(...)`:
+  - Keep `Stage.Name()` and `Stage.Workers()` stable for the lifetime of the stage registration.
+  - Mutating `Workers()` between `AddStage(...)` and `Run(...)` can cause runtime pool creation failures.
+  - If you need dynamic tuning, prefer explicit run-time options (for example a future worker-override option) over mutable stage internals.
+
+## Scanner Concurrency Pattern
+
+- Use stage workers (`Stage.Workers()` or `WithStageWorkers(...)`) as global per-stage concurrency limits.
+- For per-host limits (for example HTTP scanning), enforce host-keyed throttling inside the network stage itself.
+- Typical scanner setup combines both:
+  - global cap at the stage level for total throughput,
+  - per-host cap in-stage to avoid overloading single targets.
 
 ## Quickstart
 

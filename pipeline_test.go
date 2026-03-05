@@ -28,6 +28,31 @@ func (s testStage[T]) Process(ctx context.Context, in T) (out []T, err error) {
 	return []T{in}, nil
 }
 
+type mutableWorkersStage[T any] struct {
+	name string
+	w    atomic.Int64
+	fn   func(context.Context, T) ([]T, error)
+}
+
+func newMutableWorkersStage[T any](name string, workers int, fn func(context.Context, T) ([]T, error)) *mutableWorkersStage[T] {
+	s := &mutableWorkersStage[T]{name: name, fn: fn}
+	s.w.Store(int64(workers))
+	return s
+}
+
+func (s *mutableWorkersStage[T]) Name() string { return s.name }
+
+func (s *mutableWorkersStage[T]) Workers() int { return int(s.w.Load()) }
+
+func (s *mutableWorkersStage[T]) SetWorkers(n int) { s.w.Store(int64(n)) }
+
+func (s *mutableWorkersStage[T]) Process(ctx context.Context, in T) (out []T, err error) {
+	if s.fn != nil {
+		return s.fn(ctx, in)
+	}
+	return []T{in}, nil
+}
+
 type testTrigger[T any] struct {
 	name  string
 	stage string
@@ -260,6 +285,127 @@ func TestRunStageErrorStops(t *testing.T) {
 	_, err := p.Run(context.Background(), map[string][]int{"a": {1}})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected %v, got %v", wantErr, err)
+	}
+}
+
+func TestRunMutableWorkersCanBreakPoolCreationAfterAddStage(t *testing.T) {
+	p := NewPipeline[int]()
+	stage := newMutableWorkersStage[int]("a", 1, nil)
+	if err := p.AddStage(stage); err != nil {
+		t.Fatalf("unexpected add stage error: %v", err)
+	}
+
+	stage.SetWorkers(0)
+
+	_, err := p.Run(context.Background(), map[string][]int{"a": {1}})
+	if !errors.Is(err, ErrInvalidWorkerCount) {
+		t.Fatalf("expected ErrInvalidWorkerCount after mutating Workers(), got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "failed to create worker pool") {
+		t.Fatalf("expected pool-creation context in error, got %v", err)
+	}
+}
+
+func TestRunStageWorkersOverrideApplied(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2, 3}},
+		WithStageWorkers[int](map[string]int{"a": 3}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["a"]); got != 3 {
+		t.Fatalf("unexpected outputs with stage-worker override: got %d want %d", got, 3)
+	}
+}
+
+func TestRunStageWorkersOverrideUnknownStageRejected(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStageWorkers[int](map[string]int{"missing": 2}),
+	)
+	if !errors.Is(err, ErrStageNotFound) {
+		t.Fatalf("expected ErrStageNotFound for unknown stage override, got %v", err)
+	}
+}
+
+func TestRunStageWorkersOverrideInvalidCountRejected(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStageWorkers[int](map[string]int{"a": 0}),
+	)
+	if !errors.Is(err, ErrInvalidWorkerCount) {
+		t.Fatalf("expected ErrInvalidWorkerCount for invalid stage-worker override, got %v", err)
+	}
+}
+
+func TestRunStageWorkersLastOptionReplacesEarlierMap(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2}},
+		WithStageWorkers[int](map[string]int{"missing": 2}),
+		WithStageWorkers[int](map[string]int{"a": 2}),
+	)
+	if err != nil {
+		t.Fatalf("expected final stage-workers override map to replace earlier one, got %v", err)
+	}
+	if got := len(res["a"]); got != 2 {
+		t.Fatalf("unexpected outputs with replacement semantics: got %d want %d", got, 2)
+	}
+}
+
+func TestRunFailFastWithQueuedJobsDoesNotHang(t *testing.T) {
+	p := NewPipeline[int]()
+	wantErr := errors.New("boom")
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			if in == 0 {
+				return nil, wantErr
+			}
+			return []int{in}, nil
+		},
+	})
+
+	seeds := make([]int, 400)
+	for i := range seeds {
+		seeds[i] = i
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": seeds},
+			WithFailFast[int](true),
+			WithBufferSize[int](512),
+		)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("expected fail-fast stage error %v, got %v", wantErr, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run appears deadlocked after fail-fast cancellation with queued jobs")
 	}
 }
 

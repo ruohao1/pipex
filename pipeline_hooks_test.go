@@ -401,6 +401,68 @@ func TestHooksRunMetaEdgeCountIsTotalEdges(t *testing.T) {
 	}
 }
 
+func TestHooksRunMetaUnchangedWithStageWorkersOverride(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+
+	var gotMeta RunMeta
+	hooks := Hooks[int]{
+		RunStart: func(ctx context.Context, meta RunMeta) {
+			gotMeta = meta
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStageWorkers[int](map[string]int{"a": 4, "b": 2}),
+		WithHooks[int](hooks),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	if gotMeta.StageCount != 2 {
+		t.Fatalf("unexpected StageCount: got %d want %d", gotMeta.StageCount, 2)
+	}
+	if gotMeta.EdgeCount != 1 {
+		t.Fatalf("unexpected EdgeCount: got %d want %d", gotMeta.EdgeCount, 1)
+	}
+	if gotMeta.SeedStages != 1 || gotMeta.SeedItems != 1 {
+		t.Fatalf("unexpected seed metadata: SeedStages=%d SeedItems=%d", gotMeta.SeedStages, gotMeta.SeedItems)
+	}
+}
+
+func TestHooksRunEndGetsExactReturnedErrorForUnknownStageWorkersOverride(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+
+	var runEndErr error
+	hooks := Hooks[int]{
+		RunEnd: func(ctx context.Context, meta RunMeta, err error) {
+			runEndErr = err
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithStageWorkers[int](map[string]int{"missing": 2}),
+		WithHooks[int](hooks),
+	)
+	if err == nil {
+		t.Fatal("expected stage-worker config error")
+	}
+	if runEndErr == nil {
+		t.Fatal("expected RunEnd error to be set")
+	}
+	if err.Error() != runEndErr.Error() {
+		t.Fatalf("expected RunEnd error to match returned error: run=%q return=%q", runEndErr.Error(), err.Error())
+	}
+}
+
 func TestHooksConcurrencyUnderLoad(t *testing.T) {
 	const n = 1000
 

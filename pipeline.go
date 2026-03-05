@@ -108,6 +108,13 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 	}
 
+	for stageName := range runOpts.StageWorkers {
+		if _, ok := stages[stageName]; !ok {
+			retErr = fmt.Errorf("stage workers config: %w", StageNotFound(stageName))
+			return nil, retErr
+		}
+	}
+
 	if ctx.Err() != nil {
 		retErr = ctx.Err()
 		return nil, retErr
@@ -121,6 +128,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	var sinksWG sync.WaitGroup
 
 	jobsByStage := make(map[string]chan Job, len(stages))
+	poolsByStage := make(map[string]*Pool, len(stages))
 	sinksByStage := make(map[string][]chan T)
 
 	var errsMu sync.Mutex
@@ -160,6 +168,27 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			return
 		}
 		addErr(err)
+	}
+
+	// Snapshot stage worker configuration and ensure all pools can be created
+	// before starting any worker goroutine. This avoids partial startup leaks
+	// if one stage has an invalid worker count at run time.
+	for stageName, stage := range stages {
+		pool, err := NewPool(PoolConfig{
+			Workers: func() int {
+				if count, ok := runOpts.StageWorkers[stageName]; ok {
+					return count
+				}
+				return stage.Workers()
+			}(),
+			Queue:         runOpts.BufferSize,
+			DrainOnCancel: true,
+		})
+		if err != nil {
+			retErr = fmt.Errorf("stage %s: failed to create worker pool: %w", stageName, err)
+			return nil, retErr
+		}
+		poolsByStage[stageName] = pool
 	}
 
 	for _, sink := range runOpts.Sinks {
@@ -254,23 +283,15 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}(sink, sinkCh)
 	}
 
-	for stageName, stage := range stages {
+	for stageName := range stages {
 		stageJobs := make(chan Job, runOpts.BufferSize)
 		jobsByStage[stageName] = stageJobs
 
-		pool, err := NewPool(PoolConfig{
-			Workers: stage.Workers(),
-			Queue:   runOpts.BufferSize,
-		})
-		if err != nil {
-			retErr = fmt.Errorf("stage %s: failed to create worker pool: %w", stageName, err)
-			return nil, retErr
-		}
+		pool := poolsByStage[stageName]
 
 		poolErrWG.Add(1)
-		// Keep stage workers alive until stage queues are closed so queued jobs
-		// can still call tasksWG.Done() even after run context cancellation.
-		poolErrCh := pool.Run(context.Background(), stageJobs)
+		// Stage pools drain queued jobs after cancellation so tasksWG can reach zero.
+		poolErrCh := pool.Run(runCtx, stageJobs)
 		go func(poolErrCh <-chan error) {
 			defer poolErrWG.Done()
 			for err := range poolErrCh {

@@ -50,6 +50,7 @@ Non-scope:
 Design rule:
 
 - `internal/runtime` owns concurrency semantics; external packages should not reimplement them.
+- Runtime should execute against stable stage metadata captured at run start (for example, worker count), not mutable values that may drift mid-lifecycle.
 
 ## 2) Extraction Criteria
 
@@ -109,4 +110,3 @@ Keep in root package:
 ### Deferred until later
 
 Do not extract runtime orchestration yet (`Run` goroutine choreography, sink/trigger lifecycle), because hooks/retry policy design may still evolve and would cause churn.
-

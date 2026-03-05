@@ -1,6 +1,9 @@
 package pipex
 
-import "time"
+import (
+	"maps"
+	"time"
+)
 
 type RunOptions[T any] struct {
 	BufferSize           int
@@ -11,6 +14,7 @@ type RunOptions[T any] struct {
 	CycleMode            CycleModeOptions[T]
 	SinkRetry            SinkRetryPolicy
 	ReturnPartialResults bool
+	StageWorkers         map[string]int
 }
 
 type CycleModeOptions[T any] struct {
@@ -33,6 +37,7 @@ func defaultOptions[T any]() *RunOptions[T] {
 		FailFast:   false,
 		Triggers:   []Trigger[T]{},
 		Sinks:      []Sink[T]{},
+		Hooks:      Hooks[T]{},
 		CycleMode: CycleModeOptions[T]{
 			Enabled: false,
 			MaxHops: -1,
@@ -42,6 +47,8 @@ func defaultOptions[T any]() *RunOptions[T] {
 			MaxRetries: 10,
 			Backoff:    10 * time.Millisecond,
 		},
+		ReturnPartialResults: false,
+		StageWorkers:         map[string]int{},
 	}
 }
 
@@ -116,5 +123,13 @@ func WithSinkRetry[T any](maxRetries int, backoff time.Duration) Option[T] {
 func WithPartialResults[T any](v bool) Option[T] {
 	return func(opts *RunOptions[T]) {
 		opts.ReturnPartialResults = v
+	}
+}
+
+func WithStageWorkers[T any](stageWorkers map[string]int) Option[T] {
+	return func(opts *RunOptions[T]) {
+		stageWorkersCopy := make(map[string]int, len(stageWorkers))
+		maps.Copy(stageWorkersCopy, stageWorkers)
+		opts.StageWorkers = stageWorkersCopy
 	}
 }

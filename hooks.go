@@ -15,6 +15,8 @@ type RunMeta struct {
 	SinkCount    int
 	FailFast     bool
 	BufferSize   int
+	// RunMeta intentionally excludes per-stage runtime internals such as
+	// effective worker counts or WithStageWorkers override details.
 }
 
 type Hooks[T any] struct {

@@ -2,6 +2,7 @@ package pipex
 
 import (
 	"context"
+	"maps"
 	"testing"
 	"time"
 )
@@ -76,5 +77,41 @@ func TestWithCycleModeSetsOptions(t *testing.T) {
 	}
 	if opts.CycleMode.DedupKey == nil {
 		t.Fatal("expected DedupKey to be set")
+	}
+}
+
+func TestWithStageWorkersSetsCopiedMap(t *testing.T) {
+	opts := defaultOptions[int]()
+	in := map[string]int{"a": 2}
+
+	WithStageWorkers[int](in)(opts)
+
+	if got := opts.StageWorkers["a"]; got != 2 {
+		t.Fatalf("unexpected stage worker override: got %d want %d", got, 2)
+	}
+
+	in["a"] = 9
+	if got := opts.StageWorkers["a"]; got != 2 {
+		t.Fatalf("expected option map copy to be immutable from caller changes, got %d", got)
+	}
+	if maps.Equal(opts.StageWorkers, in) {
+		t.Fatalf("expected copied map to diverge after caller mutation, got opts=%v in=%v", opts.StageWorkers, in)
+	}
+}
+
+func TestWithStageWorkersLastCallWins(t *testing.T) {
+	opts := defaultOptions[int]()
+
+	WithStageWorkers[int](map[string]int{"a": 2, "b": 3})(opts)
+	WithStageWorkers[int](map[string]int{"c": 4})(opts)
+
+	if len(opts.StageWorkers) != 1 {
+		t.Fatalf("expected replacement semantics, got %v", opts.StageWorkers)
+	}
+	if got := opts.StageWorkers["c"]; got != 4 {
+		t.Fatalf("expected final override map to win, got c=%d map=%v", got, opts.StageWorkers)
+	}
+	if _, ok := opts.StageWorkers["a"]; ok {
+		t.Fatalf("expected earlier map entries to be replaced, got %v", opts.StageWorkers)
 	}
 }

@@ -41,6 +41,8 @@ _, err := p.Run(
 - `FailFast`
 - `BufferSize`
 
+`RunMeta` intentionally does not include per-stage runtime internals (for example effective worker counts or `WithStageWorkers(...)` override maps).
+
 ## Available Callbacks
 
 Run-level:
