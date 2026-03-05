@@ -7,11 +7,12 @@ import "errors"
 func ValidateSnapshotMapped(
 	stages map[string]struct{},
 	edges map[string][]string,
+	allowCycles bool,
 	noStages func() error,
 	stageNotFound func(string) error,
 	cycle func() error,
 ) error {
-	err := ValidateSnapshot(stages, edges)
+	err := ValidateSnapshotWithMode(stages, edges, allowCycles)
 	if err == nil {
 		return nil
 	}

@@ -6,6 +6,7 @@ A library to help you create pipelines in Golang
 - Hooks: `docs/hooks.md`
 - Triggers: `docs/triggers.md`
 - Sinks: `docs/sinks.md`
+- Cycle mode: `docs/cycle-mode.md`
 
 ## Run Options
 
@@ -145,3 +146,22 @@ Full runnable sink example:
 ```bash
 go run ./examples/sink
 ```
+
+## Cycle Mode Example
+
+```bash
+go run ./examples/cycle
+```
+
+## Cycle Mode Options
+
+`WithCycleMode(maxHops, maxJobs, dedupKey)` enables cyclic execution in `Run` with guardrails:
+
+- `maxHops`: max edge traversals from ingress (`-1` for unlimited).
+- `maxJobs`: max accepted jobs for the run (`> 0` required).
+- `dedupKey`: optional `func(T) string` for run-local dedup by `(stage, key)`.
+
+When cycle mode is enabled:
+
+- `Run` allows cyclic graphs.
+- `Validate()` remains DAG-only.

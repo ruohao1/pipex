@@ -3,6 +3,7 @@ package pipex
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -95,12 +96,15 @@ func TestConnectMissingStage(t *testing.T) {
 	}
 }
 
-func TestConnectSelfCycle(t *testing.T) {
+func TestConnectSelfLoopAllowedAndValidateDetectsCycle(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
 
-	if err := p.Connect("a", "a"); err != ErrCycle {
-		t.Fatalf("expected ErrCycle, got %v", err)
+	if err := p.Connect("a", "a"); err != nil {
+		t.Fatalf("expected self-loop connect to succeed, got %v", err)
+	}
+	if err := p.Validate(); err != ErrCycle {
+		t.Fatalf("expected Validate to return ErrCycle for self-loop, got %v", err)
 	}
 }
 
@@ -1003,5 +1007,82 @@ func TestRunPartialResultsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+func TestRunCycleGraphRejectedByDefault(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("b", "a")
+
+	_, err := p.Run(context.Background(), map[string][]int{"a": {1}})
+	if !errors.Is(err, ErrCycle) {
+		t.Fatalf("expected ErrCycle by default, got %v", err)
+	}
+}
+
+func TestRunCycleModeAllowsCycleWithMaxHops(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("b", "a")
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithCycleMode[int](2, 100, nil),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["a"]); got != 2 {
+		t.Fatalf("unexpected stage a count: got %d want %d", got, 2)
+	}
+	if got := len(res["b"]); got != 1 {
+		t.Fatalf("unexpected stage b count: got %d want %d", got, 1)
+	}
+}
+
+func TestRunCycleModeMaxJobsExceeded(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("b", "a")
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithCycleMode[int](-1, 2, nil),
+		WithFailFast[int](true),
+	)
+	if !errors.Is(err, ErrCycleModeMaxJobsExceeded) {
+		t.Fatalf("expected ErrCycleModeMaxJobsExceeded, got %v", err)
+	}
+}
+
+func TestRunCycleModeDedupStopsRevisit(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+	_ = p.Connect("b", "a")
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) }),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if got := len(res["a"]); got != 1 {
+		t.Fatalf("unexpected stage a count with dedup: got %d want %d", got, 1)
+	}
+	if got := len(res["b"]); got != 1 {
+		t.Fatalf("unexpected stage b count with dedup: got %d want %d", got, 1)
 	}
 }

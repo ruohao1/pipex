@@ -7,9 +7,17 @@ type RunOptions[T any] struct {
 	FailFast             bool
 	Triggers             []Trigger[T]
 	Sinks                []Sink[T]
-	Hooks								Hooks[T]
+	Hooks                Hooks[T]
+	CycleMode            CycleModeOptions[T]
 	SinkRetry            SinkRetryPolicy
 	ReturnPartialResults bool
+}
+
+type CycleModeOptions[T any] struct {
+	Enabled  bool
+	MaxHops  int            // -1 means unlimited
+	MaxJobs  int            // must be > 0 when enabled
+	DedupKey func(T) string // nil means dedup disabled
 }
 
 type SinkRetryPolicy struct {
@@ -25,6 +33,11 @@ func defaultOptions[T any]() *RunOptions[T] {
 		FailFast:   false,
 		Triggers:   []Trigger[T]{},
 		Sinks:      []Sink[T]{},
+		CycleMode: CycleModeOptions[T]{
+			Enabled: false,
+			MaxHops: -1,
+			MaxJobs: 0,
+		},
 		SinkRetry: SinkRetryPolicy{
 			MaxRetries: 10,
 			Backoff:    10 * time.Millisecond,
@@ -68,6 +81,17 @@ func WithSinks[T any](sinks ...Sink[T]) Option[T] {
 func WithHooks[T any](hooks Hooks[T]) Option[T] {
 	return func(opts *RunOptions[T]) {
 		opts.Hooks = hooks
+	}
+}
+
+func WithCycleMode[T any](maxHops, maxJobs int, dedupKey func(T) string) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.CycleMode = CycleModeOptions[T]{
+			Enabled:  true,
+			MaxHops:  maxHops,
+			MaxJobs:  maxJobs,
+			DedupKey: dedupKey,
+		}
 	}
 }
 

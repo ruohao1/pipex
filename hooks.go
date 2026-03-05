@@ -33,6 +33,10 @@ type Hooks[T any] struct {
 	SinkConsumeSuccess func(ctx context.Context, e SinkConsumeSuccessEvent[T])
 	SinkRetry          func(ctx context.Context, e SinkRetryEvent[T])
 	SinkExhausted      func(ctx context.Context, e SinkExhaustedEvent[T])
+
+	CycleHopLimitDrop    func(ctx context.Context, e CycleHopLimitDropEvent[T])
+	CycleDedupDrop       func(ctx context.Context, e CycleDedupDropEvent[T])
+	CycleMaxJobsExceeded func(ctx context.Context, e CycleMaxJobsExceededEvent[T])
 }
 
 // Stage events
@@ -131,4 +135,31 @@ type SinkExhaustedEvent[T any] struct {
 	Attempts int
 	Err      error
 	At       time.Time
+}
+
+// Cycle events
+type CycleHopLimitDropEvent[T any] struct {
+	RunID   string
+	Stage   string
+	Item    T
+	Hops    int
+	MaxHops int
+	At      time.Time
+}
+
+type CycleDedupDropEvent[T any] struct {
+	RunID string
+	Stage string
+	Item  T
+	Key   string
+	At    time.Time
+}
+
+type CycleMaxJobsExceededEvent[T any] struct {
+	RunID        string
+	Stage        string
+	Item         T
+	AcceptedJobs int
+	MaxJobs      int
+	At           time.Time
 }

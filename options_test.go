@@ -59,3 +59,22 @@ func TestWithHooksSetsHooks(t *testing.T) {
 		t.Fatal("expected stored hook callback to be callable")
 	}
 }
+
+func TestWithCycleModeSetsOptions(t *testing.T) {
+	opts := defaultOptions[int]()
+
+	WithCycleMode[int](5, 200, func(v int) string { return "k" })(opts)
+
+	if !opts.CycleMode.Enabled {
+		t.Fatal("expected cycle mode enabled")
+	}
+	if opts.CycleMode.MaxHops != 5 {
+		t.Fatalf("unexpected MaxHops: got %d want %d", opts.CycleMode.MaxHops, 5)
+	}
+	if opts.CycleMode.MaxJobs != 200 {
+		t.Fatalf("unexpected MaxJobs: got %d want %d", opts.CycleMode.MaxJobs, 200)
+	}
+	if opts.CycleMode.DedupKey == nil {
+		t.Fatal("expected DedupKey to be set")
+	}
+}

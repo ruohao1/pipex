@@ -30,6 +30,12 @@ func (e *ValidationError) Error() string {
 
 // ValidateSnapshot validates stage/edge consistency and cycle constraints.
 func ValidateSnapshot(stages map[string]struct{}, edges map[string][]string) error {
+	return ValidateSnapshotWithMode(stages, edges, false)
+}
+
+// ValidateSnapshotWithMode validates stage/edge consistency and can optionally
+// allow cycles.
+func ValidateSnapshotWithMode(stages map[string]struct{}, edges map[string][]string, allowCycles bool) error {
 	if len(stages) == 0 {
 		return &ValidationError{Kind: ValidationNoStages}
 	}
@@ -43,6 +49,9 @@ func ValidateSnapshot(stages map[string]struct{}, edges map[string][]string) err
 				return &ValidationError{Kind: ValidationStageNotFound, Stage: to}
 			}
 		}
+	}
+	if allowCycles {
+		return nil
 	}
 
 	visited := make(map[string]bool)

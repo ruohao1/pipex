@@ -17,8 +17,11 @@ var (
 		return fmt.Errorf("invalid worker count for stage %s: %d", name, count)
 	}
 
-	ErrEdgeExists = errors.New("edge already exists")
-	ErrCycle      = errors.New("pipeline graph contains a cycle")
+	ErrEdgeExists               = errors.New("edge already exists")
+	ErrCycle                    = errors.New("pipeline graph contains a cycle")
+	ErrCycleModeInvalidMaxHops  = errors.New("cycle mode max hops must be -1 or greater")
+	ErrCycleModeInvalidMaxJobs  = errors.New("cycle mode max jobs must be greater than zero")
+	ErrCycleModeMaxJobsExceeded = errors.New("cycle mode max jobs exceeded")
 
 	ErrNotEnoughStages = errors.New("not enough stages to connect")
 
@@ -29,4 +32,8 @@ var (
 
 func StageNotFound(name string) error {
 	return fmt.Errorf("%w: %s", ErrStageNotFound, name)
+}
+
+func CycleModeMaxJobsExceeded(maxJobs int) error {
+	return fmt.Errorf("%w: %d", ErrCycleModeMaxJobsExceeded, maxJobs)
 }

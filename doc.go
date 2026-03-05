@@ -22,4 +22,5 @@
 //   - docs/hooks.md
 //   - docs/triggers.md
 //   - docs/sinks.md
+//   - docs/cycle-mode.md
 package pipex

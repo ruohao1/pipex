@@ -73,7 +73,18 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		iruntime.Call3(runOpts.Hooks.RunEnd, ctx, runMeta, retErr)
 	}()
 
-	if err := p.validateSnapshot(stages, edges); err != nil {
+	if runOpts.CycleMode.Enabled {
+		if runOpts.CycleMode.MaxHops < -1 {
+			retErr = ErrCycleModeInvalidMaxHops
+			return nil, retErr
+		}
+		if runOpts.CycleMode.MaxJobs <= 0 {
+			retErr = ErrCycleModeInvalidMaxJobs
+			return nil, retErr
+		}
+	}
+
+	if err := p.validateSnapshot(stages, edges, runOpts.CycleMode.Enabled); err != nil {
 		retErr = err
 		return nil, retErr
 	}
@@ -115,6 +126,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	var errsMu sync.Mutex
 	var runErrs []error
 	var errOnce sync.Once
+	var frontierMu sync.Mutex
+	acceptedJobs := 0
+	reservedJobs := 0
+	seen := make(map[string]struct{})
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -264,14 +279,87 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}(poolErrCh)
 	}
 
-	var enqueue func(stageName string, in T) error
-	enqueue = func(stageName string, in T) error {
+	var enqueue func(stageName string, in T, hops int) error
+	enqueue = func(stageName string, in T, hops int) error {
 		stageJobs, ok := jobsByStage[stageName]
 		if !ok {
 			return StageNotFound(stageName)
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		var dedupInserted bool
+		var dedupMapKey string
+		var reservationTaken bool
+		if runOpts.CycleMode.Enabled {
+			var key string
+
+			if runOpts.CycleMode.DedupKey != nil {
+				dedupKeyValue, derr := func() (key string, err error) {
+					defer func() {
+						if r := recover(); r != nil {
+							err = fmt.Errorf("cycle dedup key panic: %v", r)
+						}
+					}()
+					return runOpts.CycleMode.DedupKey(in), nil
+				}()
+				if derr != nil {
+					return derr
+				}
+				key = stageName + "\x00" + dedupKeyValue
+			}
+
+			at := time.Now()
+			frontierMu.Lock()
+			if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
+				frontierMu.Unlock()
+				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
+					RunID:   runID,
+					Stage:   stageName,
+					Item:    in,
+					Hops:    hops,
+					MaxHops: runOpts.CycleMode.MaxHops,
+					At:      at,
+				})
+
+				return nil
+			}
+			if runOpts.CycleMode.DedupKey != nil {
+				if _, exists := seen[key]; exists {
+					frontierMu.Unlock()
+					iruntime.Call2(runOpts.Hooks.CycleDedupDrop, runCtx, CycleDedupDropEvent[T]{
+						RunID: runID,
+						Stage: stageName,
+						Item:  in,
+						Key:   key,
+						At:    at,
+					})
+
+					return nil
+				}
+				seen[key] = struct{}{}
+				dedupInserted = true
+				dedupMapKey = key
+			}
+			if acceptedJobs+reservedJobs >= runOpts.CycleMode.MaxJobs {
+				if dedupInserted {
+					delete(seen, dedupMapKey)
+				}
+				frontierMu.Unlock()
+				iruntime.Call2(runOpts.Hooks.CycleMaxJobsExceeded, runCtx, CycleMaxJobsExceededEvent[T]{
+					RunID:        runID,
+					Stage:        stageName,
+					Item:         in,
+					AcceptedJobs: acceptedJobs,
+					MaxJobs:      runOpts.CycleMode.MaxJobs,
+					At:           at,
+				})
+				return CycleModeMaxJobsExceeded(runOpts.CycleMode.MaxJobs)
+			}
+
+			reservedJobs++
+			reservationTaken = true
+			frontierMu.Unlock()
 		}
 
 		tasksWG.Add(1)
@@ -332,7 +420,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 				for _, nextStage := range edges[stageName] {
 					for _, item := range out {
-						if err := enqueue(nextStage, item); err != nil {
+						if err := enqueue(nextStage, item, hops+1); err != nil {
 							return fmt.Errorf("enqueue to %s: %w", nextStage, err)
 						}
 					}
@@ -345,15 +433,31 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		select {
 		case <-ctx.Done():
 			tasksWG.Done()
+			frontierMu.Lock()
+			if reservationTaken {
+				reservedJobs--
+			}
+			if dedupInserted {
+				delete(seen, dedupMapKey)
+			}
+			frontierMu.Unlock()
 			return ctx.Err()
+
 		case stageJobs <- job:
+			frontierMu.Lock()
+			if reservationTaken {
+				reservedJobs--
+			}
+			acceptedJobs++
+			frontierMu.Unlock()
 			return nil
 		}
+
 	}
 
 	for stageName, inputs := range seeds {
 		for _, input := range inputs {
-			if err := enqueue(stageName, input); err != nil {
+			if err := enqueue(stageName, input, 0); err != nil {
 				recordErr(fmt.Errorf("enqueue seed %s: %w", stageName, err))
 			}
 		}
@@ -364,7 +468,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		go func(trigger Trigger[T]) {
 			defer triggersWG.Done()
 			emit := func(item T) error {
-				if err := enqueue(trigger.Stage(), item); err != nil {
+				if err := enqueue(trigger.Stage(), item, 0); err != nil {
 					return fmt.Errorf("trigger enqueue %s: %w", trigger.Name(), err)
 				}
 				return nil
@@ -467,9 +571,6 @@ func (p *Pipeline[T]) Connect(from, to string) error {
 	// Lock the pipeline for writing to ensure thread safety when modifying the edges map.
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if from == to {
-		return ErrCycle
-	}
 	if _, okFrom := p.stages[from]; !okFrom {
 		return StageNotFound(from)
 	}
@@ -489,10 +590,10 @@ func (p *Pipeline[T]) Validate() error {
 	// Lock the pipeline for reading to ensure thread safety when accessing the stages and edges maps.
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.validateSnapshot(p.stages, p.edges)
+	return p.validateSnapshot(p.stages, p.edges, false)
 }
 
-func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string) error {
+func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string, allowCycles bool) error {
 	stageNames := make(map[string]struct{}, len(stages))
 	for name := range stages {
 		stageNames[name] = struct{}{}
@@ -501,6 +602,7 @@ func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[str
 	return graph.ValidateSnapshotMapped(
 		stageNames,
 		edges,
+		allowCycles,
 		func() error { return ErrNoStages },
 		StageNotFound,
 		func() error { return ErrCycle },
