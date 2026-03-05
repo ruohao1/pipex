@@ -25,6 +25,7 @@ A library to help you create pipelines in Golang
 - `WithStageWorkers(map[string]int)`: per-run per-stage worker overrides (must reference existing stages; each value must be `> 0`).
 - `WithStageRateLimits(map[string]RateLimit)`: per-run per-stage rate limits (`RPS > 0`, `Burst >= 1`).
 - `WithDedupRules(...)`: per-run dedup rules (`global` or `stage:<name>` scope).
+- `WithCycleMode(maxHops, maxJobs, dedupKey)`: cycle traversal guardrails. `dedupKey` is deprecated; use `WithDedupRules(...)` for dedup configuration.
 
 Defaults:
 

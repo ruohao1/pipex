@@ -38,6 +38,11 @@ func parseStageScope(s DedupScope) (stage string, ok bool) {
 	return "", false
 }
 
+type stageDedupRule[T any] struct {
+	rule          DedupRule[T]
+	isCycleCompat bool
+}
+
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
 func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Option[T]) (map[string][]T, error) {
 	runOpts := defaultOptions[T]()
@@ -160,7 +165,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	jobsByStage := make(map[string]chan Job, len(stages))
 	poolsByStage := make(map[string]*Pool, len(stages))
 	sinksByStage := make(map[string][]chan T)
-	dedupRulesByStage := make(map[string][]DedupRule[T])
+	dedupRulesByStage := make(map[string][]stageDedupRule[T])
 
 	for _, rule := range runOpts.DedupRules {
 		if rule.Name == "" {
@@ -186,13 +191,25 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, StageNotFound(stageScope))
 				return nil, retErr
 			}
-			dedupRulesByStage[stageScope] = append(dedupRulesByStage[stageScope], rule)
+			dedupRulesByStage[stageScope] = append(dedupRulesByStage[stageScope], stageDedupRule[T]{rule: rule})
 		}
 
 		if !isStageScope || rule.Scope == DedupScopeGlobal {
 			for stageName := range stages {
-				dedupRulesByStage[stageName] = append(dedupRulesByStage[stageName], rule)
+				dedupRulesByStage[stageName] = append(dedupRulesByStage[stageName], stageDedupRule[T]{rule: rule})
 			}
+		}
+	}
+	if runOpts.CycleMode.Enabled && runOpts.CycleMode.DedupKey != nil {
+		for stageName := range stages {
+			dedupRulesByStage[stageName] = append(dedupRulesByStage[stageName], stageDedupRule[T]{
+				rule: DedupRule[T]{
+					Name:  "cycle-mode-dedup",
+					Scope: DedupScopeStage(stageName),
+					Key:   runOpts.CycleMode.DedupKey,
+				},
+				isCycleCompat: true,
+			})
 		}
 	}
 
@@ -395,10 +412,15 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 
 		if dedupRules, ok := dedupRulesByStage[stageName]; ok {
-			for _, rule := range dedupRules {
+			for _, stageRule := range dedupRules {
+				rule := stageRule.rule
 				dedupKeyValue, derr := func() (key string, err error) {
 					defer func() {
 						if r := recover(); r != nil {
+							if stageRule.isCycleCompat {
+								err = fmt.Errorf("cycle dedup key panic: %v", r)
+								return
+							}
 							err = fmt.Errorf("dedup key panic: %v", r)
 						}
 					}()
@@ -411,14 +433,23 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				seenMu.Lock()
 				if _, exists := seen[key]; exists {
 					seenMu.Unlock()
-					// TODO: add a hook for dedup drops from dedup rules
-					iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
-						RunID: runID,
-						Item:  in,
-						Key:   key,
-						At:    time.Now(),
-						Scope: rule.Scope,
-					})
+					if stageRule.isCycleCompat {
+						iruntime.Call2(runOpts.Hooks.CycleDedupDrop, runCtx, CycleDedupDropEvent[T]{
+							RunID: runID,
+							Stage: stageName,
+							Item:  in,
+							Key:   key,
+							At:    time.Now(),
+						})
+					} else {
+						iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
+							RunID: runID,
+							Item:  in,
+							Key:   key,
+							At:    time.Now(),
+							Scope: rule.Scope,
+						})
+					}
 					return nil
 				}
 				seen[key] = struct{}{}
@@ -427,23 +458,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			}
 		}
 		if runOpts.CycleMode.Enabled {
-			var key string
-
-			if runOpts.CycleMode.DedupKey != nil {
-				dedupKeyValue, derr := func() (key string, err error) {
-					defer func() {
-						if r := recover(); r != nil {
-							err = fmt.Errorf("cycle dedup key panic: %v", r)
-						}
-					}()
-					return runOpts.CycleMode.DedupKey(in), nil
-				}()
-				if derr != nil {
-					return derr
-				}
-				key = stageName + "\x00" + dedupKeyValue
-			}
-
 			at := time.Now()
 			frontierMu.Lock()
 			if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
@@ -458,26 +472,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				})
 
 				return nil
-			}
-			if runOpts.CycleMode.DedupKey != nil {
-				seenMu.Lock()
-				if _, exists := seen[key]; exists {
-					seenMu.Unlock()
-					frontierMu.Unlock()
-					iruntime.Call2(runOpts.Hooks.CycleDedupDrop, runCtx, CycleDedupDropEvent[T]{
-						RunID: runID,
-						Stage: stageName,
-						Item:  in,
-						Key:   key,
-						At:    at,
-					})
-
-					return nil
-				}
-				seen[key] = struct{}{}
-
-				seenMu.Unlock()
-				dedupInsertedKeys = append(dedupInsertedKeys, key)
 			}
 			if acceptedJobs+reservedJobs >= runOpts.CycleMode.MaxJobs {
 				rollbackDedup()

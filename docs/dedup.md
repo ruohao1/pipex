@@ -19,7 +19,6 @@ type DedupRule[T any] struct {
 	Name  string
 	Scope DedupScope
 	Key   func(T) string
-	TTL   time.Duration
 }
 ```
 
@@ -64,4 +63,5 @@ res, err := p.Run(
 
 ## Notes
 
-- `TTL` is currently reserved for future behavior and is not enforced yet.
+- `WithCycleMode(..., dedupKey)` is backward-compatible but deprecated for new dedup configuration.
+- Prefer `WithDedupRules(...)` as the single dedup API surface for both cycle and non-cycle flows.

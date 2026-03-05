@@ -25,8 +25,10 @@ Parameters:
 - `maxJobs`: maximum accepted jobs in one run.
   - must be `> 0` when cycle mode is enabled.
 - `dedupKey`: optional run-local dedup key function.
-  - `nil` disables dedup.
+  - Deprecated for new configuration. Prefer `WithDedupRules(...)`.
+  - `nil` disables cycle-configured dedup.
   - when set, jobs with same `(stage, dedupKey(item))` are dropped after first acceptance.
+  - remains supported for backward compatibility.
 
 ## Guardrails
 
@@ -38,7 +40,7 @@ Cycle mode uses three guardrails to prevent runaway recursion:
 2. Job budget (`maxJobs`)
 - Returns `ErrCycleModeMaxJobsExceeded` when accepted job count exceeds budget.
 
-3. Optional dedup (`dedupKey`)
+3. Optional dedup (`dedupKey` or `WithDedupRules(...)`)
 - Prevents revisiting same stage/key pair in one run.
 
 ## Cycle Hook Events
@@ -66,6 +68,33 @@ These events are enqueue/frontier signals (not stage-processing events).
 - `ErrCycleModeInvalidMaxHops` if `maxHops < -1`.
 - `ErrCycleModeInvalidMaxJobs` if `maxJobs <= 0`.
 - `ErrCycleModeMaxJobsExceeded` if job budget is exceeded.
+
+## Dedup Migration (Recommended)
+
+New dedup configuration should use `WithDedupRules(...)`.
+
+Old style (still supported):
+
+```go
+pipex.WithCycleMode[int](-1, 100, func(v int) string { return fmt.Sprintf("%d", v) })
+```
+
+Recommended style:
+
+```go
+pipex.WithCycleMode[int](-1, 100, nil)
+pipex.WithDedupRules[int](
+	pipex.DedupRule[int]{
+		Name:  "cycle-item",
+		Scope: pipex.DedupScopeGlobal,
+		Key: func(v int) string {
+			return fmt.Sprintf("%d", v)
+		},
+	},
+)
+```
+
+Both use the same runtime dedup path.
 
 ## Example: Cyclic Graph with Dedup
 
