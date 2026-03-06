@@ -34,6 +34,14 @@ pipex.WithFrontierPendingCapacity[int](4096)
 
 If not set, capacity is auto-sized from runtime (`max(BufferSize * stageCount, 1024)`).
 
+Optional blocking enqueue mode:
+
+```go
+pipex.WithFrontierBlockingEnqueue[int](true)
+```
+
+Default is `false` (non-blocking enqueue with backpressure retry loop).
+
 ## Behavior Guarantees
 
 Frontier mode preserves core runtime semantics already expected from `Run`:
@@ -53,7 +61,8 @@ Current behavior:
 
 - pending frontier capacity is user-configurable with `WithFrontierPendingCapacity(...)`
 - if not configured, capacity is auto-sized (`max(BufferSize * stageCount, 1024)`)
-- if pending is temporarily full, enqueue retries with context-aware waiting
+- by default, if pending is temporarily full, enqueue retries with context-aware waiting
+- with `WithFrontierBlockingEnqueue(true)`, enqueue blocks until space is available or context is canceled
 - cancellation/timeout still aborts enqueue via `ctx.Done()`
 
 This is intended to avoid queue-full failures during bursty workloads.

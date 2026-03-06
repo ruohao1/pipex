@@ -1804,3 +1804,68 @@ func TestRunFrontierParityCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestRunFrontierRetryPathDoesNotUnderflowOutstandingCounter(t *testing.T) {
+	p := NewPipeline[int]()
+	var calls atomic.Int64
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			if calls.Add(1) == 1 {
+				return nil, errors.New("transient")
+			}
+			return []int{in}, nil
+		},
+	})
+
+	_, _ = p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithFrontier[int](true),
+		WithStagePolicies[int](map[string]StagePolicy{
+			"a": {MaxAttempts: 1},
+		}),
+	)
+}
+
+func TestRunFrontierFailFastCancellationDoesNotHangWithPendingEntries(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			if in == 0 {
+				return nil, errors.New("boom")
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+				return []int{in}, nil
+			}
+		},
+	})
+
+	seeds := make([]int, 500)
+	for i := range seeds {
+		seeds[i] = i
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": seeds},
+			WithFrontier[int](true),
+			WithFailFast[int](true),
+		)
+		done <- err
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run appears stuck under fail-fast cancellation with pending frontier entries")
+	}
+}

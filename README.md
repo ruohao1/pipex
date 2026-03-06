@@ -29,6 +29,7 @@ go get github.com/ruohao1/pipex@latest
 - `WithFailFast(v)`: when `true`, cancel execution on first stage error.
 - `WithFrontier(v)`: toggle frontier-backed enqueue/ack bookkeeping.
 - `WithFrontierPendingCapacity(n)`: override in-memory frontier pending queue capacity (`n > 0`).
+- `WithFrontierBlockingEnqueue(v)`: enable blocking, context-aware enqueue when frontier pending queue is full.
 - `WithTriggers(...)`: register trigger sources that emit items during runtime.
 - `WithSinks(...)`: register sinks that consume stage outputs per item during runtime.
 - `WithHooks(...)`: register runtime observability callbacks.
@@ -46,6 +47,7 @@ Defaults:
 - `FailFast`: `false`
 - `UseFrontier`: `false`
 - `FrontierPendingCap`: `0` (auto-size)
+- `FrontierBlockingEnqueue`: `false`
 - `SinkRetry.MaxRetries`: `10`
 - `SinkRetry.Backoff`: `10ms`
 

@@ -275,6 +275,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
 		defer func() { _ = fs.Close() }()
 	}
+	type frontierBlockingEnqueuer interface {
+		EnqueueWait(ctx context.Context, stage string, item T, hops int) (id uint64, err error)
+	}
+	blockingEnqueuer, hasBlockingEnqueuer := fs.(frontierBlockingEnqueuer)
 
 	var enqueueDirect func(stageName string, in T, hops int, frontierEntryID uint64) error
 	var enqueueGuarded func(stageName string, in T, hops int) error
@@ -382,31 +386,47 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			entryID uint64
 		)
 		if useFrontier {
-			for {
-				entryID, err = fs.Enqueue(stageName, in, hops)
-				if err == nil {
-					frontierOutstandingWG.Add(1)
-					iruntime.Call2(runOpts.Hooks.FrontierEnqueue, runCtx, FrontierEnqueueEvent[T]{
-						RunID:   runID,
-						EntryID: entryID,
-						Stage:   stageName,
-						Item:    in,
-						Hops:    hops,
-						At:      time.Now(),
-					})
-					break
+			if runOpts.FrontierBlockingEnqueue && hasBlockingEnqueuer {
+				entryID, err = blockingEnqueuer.EnqueueWait(runCtx, stageName, in, hops)
+			} else {
+				var backoffTicker *time.Ticker
+				stopBackoffTicker := func() {
+					if backoffTicker != nil {
+						backoffTicker.Stop()
+					}
 				}
-				if !errors.Is(err, frontier.ErrPendingQueueFull) {
-					break
+				defer stopBackoffTicker()
+				for {
+					entryID, err = fs.Enqueue(stageName, in, hops)
+					if err == nil {
+						break
+					}
+					if !errors.Is(err, frontier.ErrPendingQueueFull) {
+						break
+					}
+					if backoffTicker == nil {
+						backoffTicker = time.NewTicker(250 * time.Microsecond)
+					}
+					select {
+					case <-runCtx.Done():
+						err = runCtx.Err()
+					case <-backoffTicker.C:
+					}
+					if err != nil {
+						break
+					}
 				}
-				select {
-				case <-runCtx.Done():
-					err = runCtx.Err()
-				case <-time.After(250 * time.Microsecond):
-				}
-				if err != nil {
-					break
-				}
+			}
+			if err == nil {
+				frontierOutstandingWG.Add(1)
+				iruntime.Call2(runOpts.Hooks.FrontierEnqueue, runCtx, FrontierEnqueueEvent[T]{
+					RunID:   runID,
+					EntryID: entryID,
+					Stage:   stageName,
+					Item:    in,
+					Hops:    hops,
+					At:      time.Now(),
+				})
 			}
 		} else {
 			err = enqueueDirect(stageName, in, hops, 0)
@@ -574,8 +594,13 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			Name: fmt.Sprintf("%s_%v", stageName, in),
 			Run: func(_ context.Context) error {
 				defer tasksWG.Done()
+				requeued := false
 				if frontierEntryID != 0 {
-					defer frontierOutstandingWG.Done()
+					defer func() {
+						if !requeued {
+							frontierOutstandingWG.Done()
+						}
+					}()
 				}
 				if runCtx.Err() != nil {
 					return runCtx.Err()
@@ -730,6 +755,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 						if retryErr != nil {
 							return fmt.Errorf("stage %s: %w", stageName, errors.Join(err, fmt.Errorf("frontier retry: %w", retryErr)))
 						}
+						requeued = true
 						iruntime.Call2(runOpts.Hooks.FrontierRetry, runCtx, FrontierRetryEvent[T]{
 							RunID:   runID,
 							EntryID: frontierEntryID,
@@ -800,18 +826,19 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		if !useFrontier {
 			return
 		}
-		for {
-			entry, ok, err := fs.Reserve(runCtx)
-			if err != nil {
-				if isContextErr(err) {
-					return
-				}
-				recordErr(fmt.Errorf("frontier reserve: %w", err))
-				continue
-			}
-			if !ok {
-				return
-			}
+		batchSize := runOpts.BufferSize
+		if batchSize < 1 {
+			batchSize = 1
+		}
+		if batchSize > 64 {
+			batchSize = 64
+		}
+		type frontierBatchReserver interface {
+			ReserveBatch(ctx context.Context, max int) ([]frontier.Entry[T], bool, error)
+		}
+		batchReserver, hasBatchReserver := fs.(frontierBatchReserver)
+
+		dispatchReserved := func(entry frontier.Entry[T]) {
 			iruntime.Call2(runOpts.Hooks.FrontierReserve, runCtx, FrontierReserveEvent[T]{
 				RunID:   runID,
 				EntryID: entry.ID,
@@ -823,7 +850,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			})
 			if err := enqueueDirect(entry.Stage, entry.Input, entry.Hops, entry.ID); err != nil {
 				recordErr(fmt.Errorf("frontier dispatch: %w", err))
-				frontierOutstandingWG.Done()
 				if errors.Is(err, ErrStageNotFound) {
 					if ackErr := fs.Ack(entry.ID); ackErr != nil {
 						recordErr(fmt.Errorf("frontier ack after stage-not-found: %w", ackErr))
@@ -838,8 +864,58 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 							At:      time.Now(),
 						})
 					}
+					frontierOutstandingWG.Done()
+					return
+				}
+				if retryErr := fs.Retry(entry.ID, err); retryErr != nil {
+					recordErr(fmt.Errorf("frontier retry after dispatch failure: %w", retryErr))
+					frontierOutstandingWG.Done()
+				} else {
+					iruntime.Call2(runOpts.Hooks.FrontierRetry, runCtx, FrontierRetryEvent[T]{
+						RunID:   runID,
+						EntryID: entry.ID,
+						Stage:   entry.Stage,
+						Input:   entry.Input,
+						Hops:    entry.Hops,
+						Attempt: entry.Attempt,
+						Err:     err,
+						At:      time.Now(),
+					})
 				}
 			}
+		}
+
+		for {
+			if hasBatchReserver {
+				entries, ok, err := batchReserver.ReserveBatch(runCtx, batchSize)
+				if err != nil {
+					if isContextErr(err) {
+						return
+					}
+					recordErr(fmt.Errorf("frontier reserve batch: %w", err))
+					continue
+				}
+				if !ok {
+					return
+				}
+				for _, entry := range entries {
+					dispatchReserved(entry)
+				}
+				continue
+			}
+
+			entry, ok, err := fs.Reserve(runCtx)
+			if err != nil {
+				if isContextErr(err) {
+					return
+				}
+				recordErr(fmt.Errorf("frontier reserve: %w", err))
+				continue
+			}
+			if !ok {
+				return
+			}
+			dispatchReserved(entry)
 		}
 	})
 
@@ -897,8 +973,21 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 	triggersWG.Wait()
 	if useFrontier {
-		frontierOutstandingWG.Wait()
+		waitDone := make(chan struct{})
+		go func() {
+			frontierOutstandingWG.Wait()
+			close(waitDone)
+		}()
+		select {
+		case <-waitDone:
+		case <-runCtx.Done():
+		}
 		_ = fs.Close()
+		if drainer, ok := fs.(interface{ DrainPending() int }); ok {
+			for i := 0; i < drainer.DrainPending(); i++ {
+				frontierOutstandingWG.Done()
+			}
+		}
 		schedulerWG.Wait()
 	}
 	tasksWG.Wait()

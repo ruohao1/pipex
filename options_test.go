@@ -106,6 +106,18 @@ func TestWithFrontierPendingCapacitySetsOption(t *testing.T) {
 	}
 }
 
+func TestWithFrontierBlockingEnqueueSetsOption(t *testing.T) {
+	opts := defaultOptions[int]()
+	if opts.FrontierBlockingEnqueue {
+		t.Fatal("expected default frontier blocking enqueue disabled")
+	}
+
+	WithFrontierBlockingEnqueue[int](true)(opts)
+	if !opts.FrontierBlockingEnqueue {
+		t.Fatal("expected frontier blocking enqueue enabled")
+	}
+}
+
 func TestWithStageWorkersSetsCopiedMap(t *testing.T) {
 	opts := defaultOptions[int]()
 	in := map[string]int{"a": 2}

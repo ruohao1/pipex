@@ -175,3 +175,16 @@ func TestMemoryStoreWithCapacityRespectsPendingLimit(t *testing.T) {
 		t.Fatalf("expected ErrPendingQueueFull at configured capacity, got %v", err)
 	}
 }
+
+func TestMemoryStoreEnqueueWaitHonorsContextWhenQueueIsFull(t *testing.T) {
+	s := NewMemoryStoreWithCapacity[int](1)
+	if _, err := s.Enqueue("a", 1, 0); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	if _, err := s.EnqueueWait(ctx, "a", 2, 0); !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context error from EnqueueWait, got %v", err)
+	}
+}

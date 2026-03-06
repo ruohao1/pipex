@@ -68,7 +68,48 @@ func (s *MemoryStore[T]) Enqueue(stage string, item T, hops int) (id uint64, err
 	}
 }
 
+func (s *MemoryStore[T]) EnqueueWait(ctx context.Context, stage string, item T, hops int) (id uint64, err error) {
+	if stage == "" {
+		return 0, fmt.Errorf("invalid stage name: %w", ErrInvalidStageName)
+	}
+	if hops < 0 {
+		return 0, fmt.Errorf("invalid hops: %w", ErrInvalidHops)
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, ErrClosed
+	}
+	id = s.nextID
+	s.nextID++
+
+	entry := Entry[T]{
+		ID:      id,
+		Stage:   stage,
+		Input:   item,
+		Hops:    hops,
+		Attempt: 1,
+	}
+	s.mu.Unlock()
+
+	select {
+	case s.pendingCh <- entry:
+		return id, nil
+	case <-s.closedCh:
+		return 0, ErrClosed
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
 func (s *MemoryStore[T]) Reserve(ctx context.Context) (Entry[T], bool, error) {
+	select {
+	case <-s.closedCh:
+		return Entry[T]{}, false, nil
+	default:
+	}
+
 	select {
 	case entry := <-s.pendingCh:
 		s.mu.Lock()
@@ -79,6 +120,43 @@ func (s *MemoryStore[T]) Reserve(ctx context.Context) (Entry[T], bool, error) {
 		return Entry[T]{}, false, nil
 	case <-ctx.Done():
 		return Entry[T]{}, false, ctx.Err()
+	}
+}
+
+func (s *MemoryStore[T]) ReserveBatch(ctx context.Context, max int) ([]Entry[T], bool, error) {
+	if max <= 0 {
+		max = 1
+	}
+	first, ok, err := s.Reserve(ctx)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+
+	entries := make([]Entry[T], 0, max)
+	entries = append(entries, first)
+	for len(entries) < max {
+		select {
+		case entry := <-s.pendingCh:
+			s.mu.Lock()
+			s.inflight[entry.ID] = entry
+			s.mu.Unlock()
+			entries = append(entries, entry)
+		default:
+			return entries, true, nil
+		}
+	}
+	return entries, true, nil
+}
+
+func (s *MemoryStore[T]) DrainPending() int {
+	drained := 0
+	for {
+		select {
+		case <-s.pendingCh:
+			drained++
+		default:
+			return drained
+		}
 	}
 }
 

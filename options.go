@@ -6,20 +6,21 @@ import (
 )
 
 type RunOptions[T any] struct {
-	BufferSize           int
-	FailFast             bool
-	UseFrontier          bool
-	FrontierPendingCap   int
-	Triggers             []Trigger[T]
-	Sinks                []Sink[T]
-	Hooks                Hooks[T]
-	CycleMode            CycleModeOptions[T]
-	SinkRetry            SinkRetryPolicy
-	ReturnPartialResults bool
-	StageWorkers         map[string]int
-	StageRateLimits      map[string]RateLimit
-	StagePolicies        map[string]StagePolicy
-	DedupRules           []DedupRule[T]
+	BufferSize              int
+	FailFast                bool
+	UseFrontier             bool
+	FrontierPendingCap      int
+	FrontierBlockingEnqueue bool
+	Triggers                []Trigger[T]
+	Sinks                   []Sink[T]
+	Hooks                   Hooks[T]
+	CycleMode               CycleModeOptions[T]
+	SinkRetry               SinkRetryPolicy
+	ReturnPartialResults    bool
+	StageWorkers            map[string]int
+	StageRateLimits         map[string]RateLimit
+	StagePolicies           map[string]StagePolicy
+	DedupRules              []DedupRule[T]
 }
 
 type CycleModeOptions[T any] struct {
@@ -65,13 +66,14 @@ type Option[T any] func(*RunOptions[T])
 
 func defaultOptions[T any]() *RunOptions[T] {
 	return &RunOptions[T]{
-		BufferSize:         1024,
-		FailFast:           false,
-		UseFrontier:        false,
-		FrontierPendingCap: 0,
-		Triggers:           []Trigger[T]{},
-		Sinks:              []Sink[T]{},
-		Hooks:              Hooks[T]{},
+		BufferSize:              1024,
+		FailFast:                false,
+		UseFrontier:             false,
+		FrontierPendingCap:      0,
+		FrontierBlockingEnqueue: false,
+		Triggers:                []Trigger[T]{},
+		Sinks:                   []Sink[T]{},
+		Hooks:                   Hooks[T]{},
 		CycleMode: CycleModeOptions[T]{
 			Enabled: false,
 			MaxHops: -1,
@@ -118,6 +120,13 @@ func WithFrontierPendingCapacity[T any](n int) Option[T] {
 			return
 		}
 		opts.FrontierPendingCap = n
+	}
+}
+
+// WithFrontierBlockingEnqueue enables blocking, context-aware enqueue in frontier mode.
+func WithFrontierBlockingEnqueue[T any](enabled bool) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.FrontierBlockingEnqueue = enabled
 	}
 }
 
