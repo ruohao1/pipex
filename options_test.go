@@ -89,6 +89,23 @@ func TestWithFrontierSetsOption(t *testing.T) {
 	}
 }
 
+func TestWithFrontierPendingCapacitySetsOption(t *testing.T) {
+	opts := defaultOptions[int]()
+	if opts.FrontierPendingCap != 0 {
+		t.Fatalf("expected default frontier pending cap 0, got %d", opts.FrontierPendingCap)
+	}
+
+	WithFrontierPendingCapacity[int](4096)(opts)
+	if opts.FrontierPendingCap != 4096 {
+		t.Fatalf("unexpected frontier pending cap: got %d want 4096", opts.FrontierPendingCap)
+	}
+
+	WithFrontierPendingCapacity[int](0)(opts)
+	if opts.FrontierPendingCap != 4096 {
+		t.Fatalf("expected non-positive value to be ignored, got %d", opts.FrontierPendingCap)
+	}
+}
+
 func TestWithStageWorkersSetsCopiedMap(t *testing.T) {
 	opts := defaultOptions[int]()
 	in := map[string]int{"a": 2}

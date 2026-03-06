@@ -18,6 +18,7 @@ go get github.com/ruohao1/pipex@latest
 - Stage workers: `docs/stage-workers.md`
 - Rate limits: `docs/rate-limits.md`
 - Dedup rules: `docs/dedup.md`
+- Frontier mode: `docs/frontier.md`
 - Product plan: `docs/product-plan.md`
 
 ## Run Options
@@ -27,6 +28,7 @@ go get github.com/ruohao1/pipex@latest
 - `WithBufferSize(n)`: per-stage channel buffer size (`n > 0`).
 - `WithFailFast(v)`: when `true`, cancel execution on first stage error.
 - `WithFrontier(v)`: toggle frontier-backed enqueue/ack bookkeeping.
+- `WithFrontierPendingCapacity(n)`: override in-memory frontier pending queue capacity (`n > 0`).
 - `WithTriggers(...)`: register trigger sources that emit items during runtime.
 - `WithSinks(...)`: register sinks that consume stage outputs per item during runtime.
 - `WithHooks(...)`: register runtime observability callbacks.
@@ -43,6 +45,7 @@ Defaults:
 - `BufferSize`: `1024`
 - `FailFast`: `false`
 - `UseFrontier`: `false`
+- `FrontierPendingCap`: `0` (auto-size)
 - `SinkRetry.MaxRetries`: `10`
 - `SinkRetry.Backoff`: `10ms`
 
@@ -57,6 +60,7 @@ Defaults:
 - Invalid `WithDedupRules(...)` configuration (empty name/scope, nil key, invalid scope format, or unknown stage in `stage:<name>`) returns a run error before processing starts.
 - When `FailFast=true`, the first stage error cancels the run, and the stage error is returned (not `context.Canceled`).
 - If there are no stage errors but the context is canceled or times out, `Run` returns the context error.
+- In frontier mode, frontier `Ack`/`Retry` failures are treated as run errors (strict consistency policy).
 - By default, errors return `nil` results.
 - With `WithPartialResults(true)`, `Run` returns partial results plus the error.
 
@@ -84,6 +88,7 @@ Defaults:
 - Stage callbacks: `StageStart`, `StageFinish`, `StageError`.
 - Trigger callbacks: `TriggerStart`, `TriggerEnd`, `TriggerError`.
 - Sink callbacks: `SinkConsumeStart`, `SinkConsumeSuccess`, `SinkRetry`, `SinkExhausted`.
+- Frontier callbacks: `FrontierEnqueue`, `FrontierReserve`, `FrontierAck`, `FrontierRetry`.
 
 Minimal example:
 

@@ -162,3 +162,16 @@ func TestMemoryStoreRetryReturnsQueueFullWhenPendingBufferFull(t *testing.T) {
 		t.Fatalf("expected ErrPendingQueueFull from Retry when pending buffer is full, got %v", err)
 	}
 }
+
+func TestMemoryStoreWithCapacityRespectsPendingLimit(t *testing.T) {
+	s := NewMemoryStoreWithCapacity[int](2)
+	if _, err := s.Enqueue("a", 1, 0); err != nil {
+		t.Fatalf("enqueue 1 failed: %v", err)
+	}
+	if _, err := s.Enqueue("a", 2, 0); err != nil {
+		t.Fatalf("enqueue 2 failed: %v", err)
+	}
+	if _, err := s.Enqueue("a", 3, 0); !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("expected ErrPendingQueueFull at configured capacity, got %v", err)
+	}
+}

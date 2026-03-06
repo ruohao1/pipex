@@ -9,6 +9,7 @@ type RunOptions[T any] struct {
 	BufferSize           int
 	FailFast             bool
 	UseFrontier          bool
+	FrontierPendingCap   int
 	Triggers             []Trigger[T]
 	Sinks                []Sink[T]
 	Hooks                Hooks[T]
@@ -64,12 +65,13 @@ type Option[T any] func(*RunOptions[T])
 
 func defaultOptions[T any]() *RunOptions[T] {
 	return &RunOptions[T]{
-		BufferSize:  1024,
-		FailFast:    false,
-		UseFrontier: false,
-		Triggers:    []Trigger[T]{},
-		Sinks:       []Sink[T]{},
-		Hooks:       Hooks[T]{},
+		BufferSize:         1024,
+		FailFast:           false,
+		UseFrontier:        false,
+		FrontierPendingCap: 0,
+		Triggers:           []Trigger[T]{},
+		Sinks:              []Sink[T]{},
+		Hooks:              Hooks[T]{},
 		CycleMode: CycleModeOptions[T]{
 			Enabled: false,
 			MaxHops: -1,
@@ -105,6 +107,17 @@ func WithFailFast[T any](failFast bool) Option[T] {
 func WithFrontier[T any](enabled bool) Option[T] {
 	return func(opts *RunOptions[T]) {
 		opts.UseFrontier = enabled
+	}
+}
+
+// WithFrontierPendingCapacity sets in-memory frontier pending queue capacity.
+// Values <= 0 are ignored and keep automatic sizing.
+func WithFrontierPendingCapacity[T any](n int) Option[T] {
+	return func(opts *RunOptions[T]) {
+		if n <= 0 {
+			return
+		}
+		opts.FrontierPendingCap = n
 	}
 }
 

@@ -75,6 +75,41 @@ func BenchmarkRunWithSlowSink(b *testing.B) {
 	}
 }
 
+func BenchmarkRunFrontierMode(b *testing.B) {
+	p := benchmarkPipelineForRun()
+	seeds := benchmarkSeeds(256)
+
+	b.Run("frontier-off", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := p.Run(
+				context.Background(),
+				seeds,
+				WithBufferSize[int](256),
+				WithFrontier[int](false),
+			); err != nil {
+				b.Fatalf("run failed: %v", err)
+			}
+		}
+	})
+
+	b.Run("frontier-on", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := p.Run(
+				context.Background(),
+				seeds,
+				WithBufferSize[int](256),
+				WithFrontier[int](true),
+			); err != nil {
+				b.Fatalf("run failed: %v", err)
+			}
+		}
+	})
+}
+
 func benchmarkPipelineForStageWorkersFanout() *Pipeline[int] {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{

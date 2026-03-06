@@ -17,11 +17,18 @@ type MemoryStore[T any] struct {
 }
 
 func NewMemoryStore[T any]() *MemoryStore[T] {
+	return NewMemoryStoreWithCapacity[T](100)
+}
+
+func NewMemoryStoreWithCapacity[T any](pendingCapacity int) *MemoryStore[T] {
+	if pendingCapacity <= 0 {
+		pendingCapacity = 100
+	}
 	s := &MemoryStore[T]{
 		nextID:    1,
 		inflight:  make(map[uint64]Entry[T]),
 		closed:    false,
-		pendingCh: make(chan Entry[T], 100),
+		pendingCh: make(chan Entry[T], pendingCapacity),
 		closedCh:  make(chan struct{}),
 	}
 	return s

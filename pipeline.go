@@ -176,6 +176,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	var poolErrWG sync.WaitGroup
 	var triggersWG sync.WaitGroup
 	var sinksWG sync.WaitGroup
+	var frontierOutstandingWG sync.WaitGroup
 
 	jobsByStage := make(map[string]chan Job, len(stages))
 	poolsByStage := make(map[string]*Pool, len(stages))
@@ -264,7 +265,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	useFrontier := runOpts.UseFrontier
 	var fs frontier.Store[T]
 	if useFrontier {
-		fs = frontier.NewMemoryStore[T]()
+		frontierCap := runOpts.FrontierPendingCap
+		if frontierCap <= 0 {
+			frontierCap = runOpts.BufferSize * len(stages)
+			if frontierCap < 1024 {
+				frontierCap = 1024
+			}
+		}
+		fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
 		defer func() { _ = fs.Close() }()
 	}
 
@@ -369,17 +377,35 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		default:
 		}
 
-		var err error
+		var (
+			err     error
+			entryID uint64
+		)
 		if useFrontier {
-			_, err = fs.Enqueue(stageName, in, hops)
-			if err == nil {
-				entry, ok, reserveErr := fs.Reserve(runCtx)
-				if reserveErr != nil {
-					err = reserveErr
-				} else if !ok {
-					err = frontier.ErrClosed
-				} else {
-					err = enqueueDirect(entry.Stage, entry.Input, entry.Hops, entry.ID)
+			for {
+				entryID, err = fs.Enqueue(stageName, in, hops)
+				if err == nil {
+					frontierOutstandingWG.Add(1)
+					iruntime.Call2(runOpts.Hooks.FrontierEnqueue, runCtx, FrontierEnqueueEvent[T]{
+						RunID:   runID,
+						EntryID: entryID,
+						Stage:   stageName,
+						Item:    in,
+						Hops:    hops,
+						At:      time.Now(),
+					})
+					break
+				}
+				if !errors.Is(err, frontier.ErrPendingQueueFull) {
+					break
+				}
+				select {
+				case <-runCtx.Done():
+					err = runCtx.Err()
+				case <-time.After(250 * time.Microsecond):
+				}
+				if err != nil {
+					break
 				}
 			}
 		} else {
@@ -548,6 +574,9 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			Name: fmt.Sprintf("%s_%v", stageName, in),
 			Run: func(_ context.Context) error {
 				defer tasksWG.Done()
+				if frontierEntryID != 0 {
+					defer frontierOutstandingWG.Done()
+				}
 				if runCtx.Err() != nil {
 					return runCtx.Err()
 				}
@@ -697,7 +726,20 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 				if err != nil {
 					if frontierEntryID != 0 {
-						_ = fs.Retry(frontierEntryID, err)
+						retryErr := fs.Retry(frontierEntryID, err)
+						if retryErr != nil {
+							return fmt.Errorf("stage %s: %w", stageName, errors.Join(err, fmt.Errorf("frontier retry: %w", retryErr)))
+						}
+						iruntime.Call2(runOpts.Hooks.FrontierRetry, runCtx, FrontierRetryEvent[T]{
+							RunID:   runID,
+							EntryID: frontierEntryID,
+							Stage:   stageName,
+							Input:   in,
+							Hops:    hops,
+							Attempt: 0,
+							Err:     err,
+							At:      time.Now(),
+						})
 					}
 					return fmt.Errorf("stage %s: %w", stageName, err)
 				}
@@ -728,6 +770,15 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					if err := fs.Ack(frontierEntryID); err != nil {
 						return fmt.Errorf("frontier ack: %w", err)
 					}
+					iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
+						RunID:   runID,
+						EntryID: frontierEntryID,
+						Stage:   stageName,
+						Input:   in,
+						Hops:    hops,
+						Attempt: 0,
+						At:      time.Now(),
+					})
 				}
 				return nil
 			},
@@ -743,6 +794,54 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 
 	}
+
+	var schedulerWG sync.WaitGroup
+	schedulerWG.Go(func() {
+		if !useFrontier {
+			return
+		}
+		for {
+			entry, ok, err := fs.Reserve(runCtx)
+			if err != nil {
+				if isContextErr(err) {
+					return
+				}
+				recordErr(fmt.Errorf("frontier reserve: %w", err))
+				continue
+			}
+			if !ok {
+				return
+			}
+			iruntime.Call2(runOpts.Hooks.FrontierReserve, runCtx, FrontierReserveEvent[T]{
+				RunID:   runID,
+				EntryID: entry.ID,
+				Stage:   entry.Stage,
+				Input:   entry.Input,
+				Hops:    entry.Hops,
+				Attempt: entry.Attempt,
+				At:      time.Now(),
+			})
+			if err := enqueueDirect(entry.Stage, entry.Input, entry.Hops, entry.ID); err != nil {
+				recordErr(fmt.Errorf("frontier dispatch: %w", err))
+				frontierOutstandingWG.Done()
+				if errors.Is(err, ErrStageNotFound) {
+					if ackErr := fs.Ack(entry.ID); ackErr != nil {
+						recordErr(fmt.Errorf("frontier ack after stage-not-found: %w", ackErr))
+					} else {
+						iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
+							RunID:   runID,
+							EntryID: entry.ID,
+							Stage:   entry.Stage,
+							Input:   entry.Input,
+							Hops:    entry.Hops,
+							Attempt: entry.Attempt,
+							At:      time.Now(),
+						})
+					}
+				}
+			}
+		}
+	})
 
 	for stageName, inputs := range seeds {
 		for _, input := range inputs {
@@ -797,6 +896,11 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	}
 
 	triggersWG.Wait()
+	if useFrontier {
+		frontierOutstandingWG.Wait()
+		_ = fs.Close()
+		schedulerWG.Wait()
+	}
 	tasksWG.Wait()
 	for _, jobsCh := range jobsByStage {
 		close(jobsCh)
