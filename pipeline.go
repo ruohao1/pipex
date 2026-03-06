@@ -280,7 +280,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	}
 	blockingEnqueuer, hasBlockingEnqueuer := fs.(frontierBlockingEnqueuer)
 
-	var enqueueDirect func(stageName string, in T, hops int, frontierEntryID uint64) error
+	var enqueueDirect func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error
 	var enqueueGuarded func(stageName string, in T, hops int) error
 	enqueueGuarded = func(stageName string, in T, hops int) error {
 		if ctx.Err() != nil {
@@ -429,7 +429,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				})
 			}
 		} else {
-			err = enqueueDirect(stageName, in, hops, 0)
+			err = enqueueDirect(stageName, in, hops, 0, 0)
 		}
 		if err != nil {
 			frontierMu.Lock()
@@ -580,7 +580,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}(poolErrCh)
 	}
 
-	enqueueDirect = func(stageName string, in T, hops int, frontierEntryID uint64) error {
+	enqueueDirect = func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error {
 		stageJobs, ok := jobsByStage[stageName]
 		if !ok {
 			return StageNotFound(stageName)
@@ -594,13 +594,8 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			Name: fmt.Sprintf("%s_%v", stageName, in),
 			Run: func(_ context.Context) error {
 				defer tasksWG.Done()
-				requeued := false
 				if frontierEntryID != 0 {
-					defer func() {
-						if !requeued {
-							frontierOutstandingWG.Done()
-						}
-					}()
+					defer frontierOutstandingWG.Done()
 				}
 				if runCtx.Err() != nil {
 					return runCtx.Err()
@@ -751,19 +746,17 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 				if err != nil {
 					if frontierEntryID != 0 {
-						retryErr := fs.Retry(frontierEntryID, err)
-						if retryErr != nil {
-							return fmt.Errorf("stage %s: %w", stageName, errors.Join(err, fmt.Errorf("frontier retry: %w", retryErr)))
+						ackErr := fs.Ack(frontierEntryID)
+						if ackErr != nil {
+							return fmt.Errorf("stage %s: %w", stageName, errors.Join(err, fmt.Errorf("frontier ack after stage error: %w", ackErr)))
 						}
-						requeued = true
-						iruntime.Call2(runOpts.Hooks.FrontierRetry, runCtx, FrontierRetryEvent[T]{
+						iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
 							RunID:   runID,
 							EntryID: frontierEntryID,
 							Stage:   stageName,
 							Input:   in,
 							Hops:    hops,
-							Attempt: 0,
-							Err:     err,
+							Attempt: frontierEntryAttempt,
 							At:      time.Now(),
 						})
 					}
@@ -802,7 +795,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 						Stage:   stageName,
 						Input:   in,
 						Hops:    hops,
-						Attempt: 0,
+						Attempt: frontierEntryAttempt,
 						At:      time.Now(),
 					})
 				}
@@ -848,7 +841,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				Attempt: entry.Attempt,
 				At:      time.Now(),
 			})
-			if err := enqueueDirect(entry.Stage, entry.Input, entry.Hops, entry.ID); err != nil {
+			if err := enqueueDirect(entry.Stage, entry.Input, entry.Hops, entry.ID, entry.Attempt); err != nil {
 				recordErr(fmt.Errorf("frontier dispatch: %w", err))
 				if errors.Is(err, ErrStageNotFound) {
 					if ackErr := fs.Ack(entry.ID); ackErr != nil {
@@ -868,6 +861,12 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					return
 				}
 				if retryErr := fs.Retry(entry.ID, err); retryErr != nil {
+					if errors.Is(retryErr, frontier.ErrNotFound) {
+						// Entry may already be terminalized by worker path (acked on
+						// non-retriable stage exhaustion/error). Outstanding counter is
+						// decremented there.
+						return
+					}
 					recordErr(fmt.Errorf("frontier retry after dispatch failure: %w", retryErr))
 					frontierOutstandingWG.Done()
 				} else {

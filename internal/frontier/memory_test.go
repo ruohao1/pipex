@@ -163,6 +163,32 @@ func TestMemoryStoreRetryReturnsQueueFullWhenPendingBufferFull(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreRetryQueueFullKeepsEntryInflight(t *testing.T) {
+	s := NewMemoryStore[int]()
+	_, err := s.Enqueue("a", 1, 0)
+	if err != nil {
+		t.Fatalf("seed enqueue failed: %v", err)
+	}
+	e, ok, err := s.Reserve(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("seed reserve failed: ok=%v err=%v", ok, err)
+	}
+
+	for i := 0; i < 100; i++ {
+		if _, err := s.Enqueue("a", i, 0); err != nil {
+			t.Fatalf("enqueue %d failed unexpectedly: %v", i, err)
+		}
+	}
+
+	if err := s.Retry(e.ID, errors.New("retry")); !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("expected ErrPendingQueueFull from Retry when pending buffer is full, got %v", err)
+	}
+
+	if err := s.Ack(e.ID); err != nil {
+		t.Fatalf("expected inflight entry to remain ackable after queue-full retry, got %v", err)
+	}
+}
+
 func TestMemoryStoreWithCapacityRespectsPendingLimit(t *testing.T) {
 	s := NewMemoryStoreWithCapacity[int](2)
 	if _, err := s.Enqueue("a", 1, 0); err != nil {

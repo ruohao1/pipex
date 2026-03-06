@@ -14,7 +14,7 @@ For users, this mainly means a more explicit runtime path for enqueueing and dis
 
 ## Enable It
 
-Use `WithFrontier(true)` when running a pipeline.
+Use `WithFrontier(true)` when running a pipeline. For security workflows, this is the recommended runtime mode.
 
 ```go
 res, err := p.Run(
@@ -24,7 +24,7 @@ res, err := p.Run(
 )
 ```
 
-Default is disabled (`WithFrontier(false)`).
+Current code default is disabled (`WithFrontier(false)`) for backward compatibility.
 
 Optional capacity override:
 
@@ -51,11 +51,17 @@ Frontier mode preserves core runtime semantics already expected from `Run`:
 - cancellation is respected through run context
 - seeds, triggers, and downstream fanout all use the same guarded enqueue path
 
-Parity tests currently validate these behaviors in both frontier-off and frontier-on modes.
+Parity tests validate these behaviors in both frontier-off and frontier-on modes.
+
+Frontier retry semantics are intentionally bounded by stage policy:
+
+- stage attempt retries are controlled by `WithStagePolicies(...)`
+- when a stage exhausts `MaxAttempts`, frontier does not requeue indefinitely
+- exhausted stage errors are terminal for that frontier entry
 
 ## Backpressure Behavior
 
-Under load, frontier mode can apply enqueue backpressure instead of dropping accepted work immediately.
+Under load, frontier mode applies enqueue backpressure instead of dropping accepted work immediately.
 
 Current behavior:
 
@@ -69,22 +75,25 @@ This is intended to avoid queue-full failures during bursty workloads.
 
 ## Performance Expectations
 
-Frontier mode has overhead compared to the direct path.
+Frontier mode has overhead compared to the direct path (`WithFrontier(false)`), because dispatch goes through frontier enqueue/reserve/ack.
 
-Local benchmark snapshot (2-stage CPU-bound pipeline, 256 seeds, `WithBufferSize(256)`):
+Recent benchmark snapshot (machine-local, `BenchmarkRunFrontierComprehensive`):
 
-- frontier off: ~1.90 ms/op
-- frontier on: ~2.65 ms/op
-- overhead: ~1.39x (`+39%`)
+- linear-success-256: frontier-on `+43%` vs frontier-off
+- linear-success-2048: frontier-on `+74%` vs frontier-off
+- fanout-success-512: frontier-on `+113%` vs frontier-off
+- retry-exhaustion-mixed-512: frontier-on `+15%` vs frontier-off
+- sink-slow-256: frontier-on `+7%` vs frontier-off
 
 Interpretation:
 
-- this overhead may be less visible in I/O-heavy workloads
-- for CPU-bound micro-pipelines, expect measurable scheduling/coordination cost
+- overhead is most visible in CPU-bound, high-fanout workloads
+- overhead is less visible when downstream I/O dominates
+- blocking enqueue mode can be significantly slower and should be enabled only when you need strict enqueue blocking semantics
 
 ## When To Use It
 
-Use frontier mode when you value explicit queued scheduling and controlled backpressure behavior.
+Use frontier mode when you value recoverable queued scheduling, explicit progress tracking, and controlled backpressure behavior.
 
 Keep it off when raw throughput on simple CPU-bound flows is the top priority.
 
@@ -104,6 +113,7 @@ What frontier mode currently provides:
 
 - in-memory frontier-backed scheduling
 - guarded enqueue parity with existing runtime semantics
+- terminal handling for stage exhaustion (bounded by stage `MaxAttempts`)
 
 What is not provided yet:
 

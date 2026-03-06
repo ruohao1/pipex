@@ -43,26 +43,22 @@ func (s *MemoryStore[T]) Enqueue(stage string, item T, hops int) (id uint64, err
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
 		return 0, ErrClosed
 	}
-	id = s.nextID
-	s.nextID++
-
 	entry := Entry[T]{
-		ID:      id,
+		ID:      s.nextID,
 		Stage:   stage,
 		Input:   item,
 		Hops:    hops,
 		Attempt: 1,
 	}
-	s.mu.Unlock()
+
 	select {
 	case s.pendingCh <- entry:
-		return id, nil
-	case <-s.closedCh:
-		return 0, ErrClosed
+		s.nextID++
+		return entry.ID, nil
 	default:
 		return 0, ErrPendingQueueFull
 	}
@@ -173,26 +169,23 @@ func (s *MemoryStore[T]) Ack(id uint64) error {
 
 func (s *MemoryStore[T]) Retry(id uint64, cause error) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
 		return ErrClosed
 	}
 	entry, ok := s.inflight[id]
-	if ok {
-		delete(s.inflight, id)
-		s.mu.Unlock()
-		entry.Attempt++
-		select {
-		case s.pendingCh <- entry:
-			return nil
-		case <-s.closedCh:
-			return ErrClosed
-		default:
-			return ErrPendingQueueFull
-		}
+	if !ok {
+		return fmt.Errorf("%w: id=%d", ErrNotFound, id)
 	}
-	s.mu.Unlock()
-	return fmt.Errorf("%w: id=%d", ErrNotFound, id)
+
+	entry.Attempt++
+	select {
+	case s.pendingCh <- entry:
+		delete(s.inflight, id)
+		return nil
+	default:
+		return ErrPendingQueueFull
+	}
 }
 
 func (s *MemoryStore[T]) Close() error {

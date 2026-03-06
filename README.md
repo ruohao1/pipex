@@ -27,7 +27,9 @@ go get github.com/ruohao1/pipex@latest
 
 - `WithBufferSize(n)`: per-stage channel buffer size (`n > 0`).
 - `WithFailFast(v)`: when `true`, cancel execution on first stage error.
-- `WithFrontier(v)`: toggle frontier-backed enqueue/ack bookkeeping.
+- `WithFrontier(v)`: choose runtime mode.
+  - `true`: frontier-backed recoverable scheduling mode (recommended for security workflows).
+  - `false`: ephemeral direct-dispatch mode (lower overhead, no frontier queue/ack path).
 - `WithFrontierPendingCapacity(n)`: override in-memory frontier pending queue capacity (`n > 0`).
 - `WithFrontierBlockingEnqueue(v)`: enable blocking, context-aware enqueue when frontier pending queue is full.
 - `WithTriggers(...)`: register trigger sources that emit items during runtime.
@@ -128,6 +130,7 @@ See detailed contract: `docs/hooks.md`.
 - Sinks with persistent failures will eventually disable themselves after retry exhaustion unless `MaxRetries=-1`.
 - Using `MaxRetries=-1` means infinite retry and can keep a run alive if the sink never succeeds.
 - If you need progress on failure/cancellation, enable `WithPartialResults(true)`.
+- Frontier mode is the recommended execution model for long-running security workflows, but it adds measurable coordination overhead in CPU-bound microbenchmarks.
 - Treat stage definitions as immutable after `AddStage(...)`:
   - Keep `Stage.Name()` and `Stage.Workers()` stable for the lifetime of the stage registration.
   - Mutating `Workers()` between `AddStage(...)` and `Run(...)` can cause runtime pool creation failures.
@@ -152,6 +155,7 @@ _ = p.Connect("src", "out")
 res, err := p.Run(
 	context.Background(),
 	map[string][]int{"src": {1, 2, 3}},
+	pipex.WithFrontier[int](true), // canonical recoverable mode
 	pipex.WithBufferSize[int](64),
 	pipex.WithFailFast[int](true),
 )

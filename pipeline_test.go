@@ -1829,6 +1829,46 @@ func TestRunFrontierRetryPathDoesNotUnderflowOutstandingCounter(t *testing.T) {
 	)
 }
 
+func TestRunFrontierStageExhaustionIsTerminal(t *testing.T) {
+	p := NewPipeline[int]()
+	wantErr := errors.New("boom")
+	var calls atomic.Int64
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			calls.Add(1)
+			return nil, wantErr
+		},
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": {1}},
+			WithFrontier[int](true),
+			WithFailFast[int](false),
+			WithStagePolicies[int](map[string]StagePolicy{
+				"a": {MaxAttempts: 2},
+			}),
+		)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("expected stage error %v, got %v", wantErr, err)
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("expected exactly 2 stage attempts with no frontier requeue, got %d", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run appears stuck; exhausted frontier work should be terminal")
+	}
+}
+
 func TestRunFrontierFailFastCancellationDoesNotHangWithPendingEntries(t *testing.T) {
 	p := NewPipeline[int]()
 	_ = p.AddStage(testStage[int]{
