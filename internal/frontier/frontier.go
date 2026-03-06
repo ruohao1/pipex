@@ -5,7 +5,7 @@ import "context"
 type Entry[T any] struct {
 	ID      uint64
 	Stage   string
-	Item    T
+	Input   T
 	Hops    int
 	Attempt int
 }
