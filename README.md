@@ -26,6 +26,7 @@ go get github.com/ruohao1/pipex@latest
 
 - `WithBufferSize(n)`: per-stage channel buffer size (`n > 0`).
 - `WithFailFast(v)`: when `true`, cancel execution on first stage error.
+- `WithFrontier(v)`: toggle frontier-backed enqueue/ack bookkeeping.
 - `WithTriggers(...)`: register trigger sources that emit items during runtime.
 - `WithSinks(...)`: register sinks that consume stage outputs per item during runtime.
 - `WithHooks(...)`: register runtime observability callbacks.
@@ -41,6 +42,7 @@ Defaults:
 
 - `BufferSize`: `1024`
 - `FailFast`: `false`
+- `UseFrontier`: `false`
 - `SinkRetry.MaxRetries`: `10`
 - `SinkRetry.Backoff`: `10ms`
 

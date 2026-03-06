@@ -46,7 +46,7 @@ func (s *MemoryStore[T]) Enqueue(stage string, item T, hops int) (id uint64, err
 	entry := Entry[T]{
 		ID:      id,
 		Stage:   stage,
-		Input:    item,
+		Input:   item,
 		Hops:    hops,
 		Attempt: 1,
 	}

@@ -261,10 +261,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		addErr(err)
 	}
 
-	useFrontier := false
-	fs := frontier.NewMemoryStore[T]()
-	defer func() { _ = fs.Close() }()
+	useFrontier := runOpts.UseFrontier
+	var fs frontier.Store[T]
+	if useFrontier {
+		fs = frontier.NewMemoryStore[T]()
+		defer func() { _ = fs.Close() }()
+	}
 
+	var enqueueDirect func(stageName string, in T, hops int, frontierEntryID uint64) error
 	var enqueueGuarded func(stageName string, in T, hops int) error
 	enqueueGuarded = func(stageName string, in T, hops int) error {
 		if ctx.Err() != nil {
@@ -365,7 +369,22 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		default:
 		}
 
-		_, err := fs.Enqueue(stageName, in, hops)
+		var err error
+		if useFrontier {
+			_, err = fs.Enqueue(stageName, in, hops)
+			if err == nil {
+				entry, ok, reserveErr := fs.Reserve(runCtx)
+				if reserveErr != nil {
+					err = reserveErr
+				} else if !ok {
+					err = frontier.ErrClosed
+				} else {
+					err = enqueueDirect(entry.Stage, entry.Input, entry.Hops, entry.ID)
+				}
+			}
+		} else {
+			err = enqueueDirect(stageName, in, hops, 0)
+		}
 		if err != nil {
 			frontierMu.Lock()
 			if reservationTaken {
@@ -384,228 +403,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		frontierMu.Unlock()
 		return nil
 	}
-
-	// Scheduler
-	var shedulerWG sync.WaitGroup
-	shedulerWG.Go(func() {
-		if !useFrontier {
-			return
-		}
-
-		for {
-			entry, ok, err := fs.Reserve(ctx)
-			if err != nil {
-				recordErr(fmt.Errorf("frontier reserve: %w", err))
-				continue
-			}
-			if !ok {
-				break
-			}
-			stageJobs, ok := jobsByStage[entry.Stage]
-
-			if !ok {
-				recordErr(StageNotFound(entry.Stage))
-				continue
-			}
-
-			job := Job{
-				Name: fmt.Sprintf("%s_%v", entry.Stage, entry.Input),
-				Run: func(_ context.Context) error {
-					defer tasksWG.Done()
-					if runCtx.Err() != nil {
-						return runCtx.Err()
-					}
-
-					stage := stages[entry.Stage]
-
-					if limiter, ok := limiters[entry.Stage]; ok {
-						if err := limiter.Wait(runCtx); err != nil {
-							return fmt.Errorf("stage %s: rate limit wait: %w", entry.Stage, err)
-						}
-					}
-
-					policy, hasPolicy := runOpts.StagePolicies[entry.Stage]
-					if !hasPolicy {
-						policy = StagePolicy{MaxAttempts: 1}
-					}
-					if policy.MaxAttempts <= 0 {
-						policy.MaxAttempts = 1
-					}
-
-					stageStart := time.Now()
-					iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
-						RunID:     runID,
-						Stage:     entry.Stage,
-						Input:     entry.Input,
-						StartedAt: stageStart,
-					})
-
-					var (
-						out []T
-						err error
-					)
-
-					for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
-						attemptCtx := runCtx
-						var cancel context.CancelFunc = func() {}
-						if policy.Timeout > 0 {
-							attemptCtx, cancel = context.WithTimeout(runCtx, policy.Timeout)
-						}
-
-						attemptStart := time.Now()
-						iruntime.Call2(runOpts.Hooks.StageAttemptStart, runCtx, StageAttemptStartEvent[T]{
-							RunID:     runID,
-							Stage:     entry.Stage,
-							Input:     entry.Input,
-							Attempt:   attempt,
-							StartedAt: attemptStart,
-						})
-						out, err = stage.Process(attemptCtx, entry.Input)
-						attemptFinish := time.Now()
-						attemptDuration := attemptFinish.Sub(attemptStart)
-						cancel()
-
-						if err == nil {
-							iruntime.Call2(runOpts.Hooks.StageFinish, runCtx, StageFinishEvent[T]{
-								RunID:      runID,
-								Stage:      entry.Stage,
-								Input:      entry.Input,
-								OutCount:   len(out),
-								StartedAt:  stageStart,
-								FinishedAt: attemptFinish,
-								Duration:   attemptFinish.Sub(stageStart),
-							})
-							break
-						}
-
-						iruntime.Call2(runOpts.Hooks.StageAttemptError, runCtx, StageAttemptErrorEvent[T]{
-							RunID:      runID,
-							Stage:      entry.Stage,
-							Input:      entry.Input,
-							Attempt:    attempt,
-							StartedAt:  attemptStart,
-							FinishedAt: attemptFinish,
-							Duration:   attemptDuration,
-							Err:        err,
-						})
-						if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
-							iruntime.Call2(runOpts.Hooks.StageTimeout, runCtx, StageTimeoutEvent[T]{
-								RunID:     runID,
-								Stage:     entry.Stage,
-								Input:     entry.Input,
-								Attempt:   attempt,
-								StartedAt: attemptStart,
-								Timeout:   policy.Timeout,
-								At:        attemptFinish,
-							})
-						}
-
-						// stop immediately on run cancellation
-						if runCtx.Err() != nil {
-							if !isContextErr(err) {
-								iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
-									RunID:      runID,
-									Stage:      entry.Stage,
-									Input:      entry.Input,
-									StartedAt:  stageStart,
-									FinishedAt: attemptFinish,
-									Duration:   attemptFinish.Sub(stageStart),
-									Err:        err,
-								})
-								return fmt.Errorf("stage %s: %w", entry.Stage, err)
-							}
-							return runCtx.Err()
-						}
-
-						// no retries left
-						if attempt == policy.MaxAttempts {
-							iruntime.Call2(runOpts.Hooks.StageExhausted, runCtx, StageExhaustedEvent[T]{
-								RunID:    runID,
-								Stage:    entry.Stage,
-								Input:    entry.Input,
-								Attempts: attempt,
-								Err:      err,
-								At:       attemptFinish,
-							})
-							iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
-								RunID:      runID,
-								Stage:      entry.Stage,
-								Input:      entry.Input,
-								StartedAt:  stageStart,
-								FinishedAt: attemptFinish,
-								Duration:   attemptFinish.Sub(stageStart),
-								Err:        err,
-							})
-							break
-						}
-
-						iruntime.Call2(runOpts.Hooks.StageRetry, runCtx, StageRetryEvent[T]{
-							RunID:   runID,
-							Stage:   entry.Stage,
-							Input:   entry.Input,
-							Attempt: attempt,
-							Err:     err,
-							Backoff: policy.Backoff,
-							At:      attemptFinish,
-						})
-
-						// context-aware backoff
-						if policy.Backoff > 0 {
-							select {
-							case <-runCtx.Done():
-								return runCtx.Err()
-							case <-time.After(policy.Backoff):
-							}
-						}
-					}
-
-					if err != nil {
-						return fmt.Errorf("stage %s: %w", entry.Stage, err)
-					}
-
-					resultsMu.Lock()
-					results[entry.Stage] = append(results[entry.Stage], out...)
-					resultsMu.Unlock()
-
-					for _, item := range out {
-						for _, sinkCh := range sinksByStage[entry.Stage] {
-							select {
-							case <-runCtx.Done():
-								return runCtx.Err()
-							case sinkCh <- item:
-							}
-						}
-					}
-
-					for _, nextStage := range edges[entry.Stage] {
-						for _, item := range out {
-							err := enqueueGuarded(nextStage, item, entry.Hops+1)
-							if err != nil {
-								return fmt.Errorf("enqueue to %s: %w", nextStage, err)
-							}
-						}
-					}
-
-					if err := fs.Ack(entry.ID); err != nil {
-						recordErr(fmt.Errorf("frontier ack: %w", err))
-					}
-					return nil
-				},
-			}
-
-			tasksWG.Add(1)
-			select {
-			case <-ctx.Done():
-				tasksWG.Done()
-				return
-			case stageJobs <- job:
-				frontierMu.Lock()
-				acceptedJobs++
-				frontierMu.Unlock()
-			}
-
-		}
-	})
 
 	// Snapshot stage worker configuration and ensure all pools can be created
 	// before starting any worker goroutine. This avoids partial startup leaks
@@ -737,96 +534,13 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}(poolErrCh)
 	}
 
-	var enqueue func(stageName string, in T, hops int) error
-	enqueue = func(stageName string, in T, hops int) error {
+	enqueueDirect = func(stageName string, in T, hops int, frontierEntryID uint64) error {
 		stageJobs, ok := jobsByStage[stageName]
 		if !ok {
 			return StageNotFound(stageName)
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
-		}
-		dedupInsertedKeys := make([]string, 0, 4)
-		var reservationTaken bool
-		var key string
-		rollbackDedup := func() {
-			if len(dedupInsertedKeys) == 0 {
-				return
-			}
-			seenMu.Lock()
-			for _, k := range dedupInsertedKeys {
-				delete(seen, k)
-			}
-			seenMu.Unlock()
-		}
-
-		if dedupRules, ok := dedupRulesByStage[stageName]; ok {
-			for _, rule := range dedupRules {
-				dedupKeyValue, derr := func() (key string, err error) {
-					defer func() {
-						if r := recover(); r != nil {
-							err = fmt.Errorf("dedup key panic: %v", r)
-						}
-					}()
-					return rule.Key(in), nil
-				}()
-				if derr != nil {
-					rollbackDedup()
-					return derr
-				}
-				key = stageName + "\x00" + dedupKeyValue
-				dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
-				seenMu.Lock()
-				if _, exists := seen[dedupMapKey]; exists {
-					seenMu.Unlock()
-					iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
-						RunID: runID,
-						Item:  in,
-						Key:   key,
-						At:    time.Now(),
-						Scope: rule.Scope,
-					})
-					return nil
-				}
-				seen[dedupMapKey] = struct{}{}
-				dedupInsertedKeys = append(dedupInsertedKeys, dedupMapKey)
-				seenMu.Unlock()
-			}
-		}
-		if runOpts.CycleMode.Enabled {
-			at := time.Now()
-			frontierMu.Lock()
-			if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
-				rollbackDedup()
-				frontierMu.Unlock()
-				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
-					RunID:   runID,
-					Stage:   stageName,
-					Item:    in,
-					Hops:    hops,
-					MaxHops: runOpts.CycleMode.MaxHops,
-					At:      at,
-				})
-
-				return nil
-			}
-			if acceptedJobs+reservedJobs >= runOpts.CycleMode.MaxJobs {
-				rollbackDedup()
-				frontierMu.Unlock()
-				iruntime.Call2(runOpts.Hooks.CycleMaxJobsExceeded, runCtx, CycleMaxJobsExceededEvent[T]{
-					RunID:        runID,
-					Stage:        stageName,
-					Item:         in,
-					AcceptedJobs: acceptedJobs,
-					MaxJobs:      runOpts.CycleMode.MaxJobs,
-					At:           at,
-				})
-				return CycleModeMaxJobsExceeded(runOpts.CycleMode.MaxJobs)
-			}
-
-			reservedJobs++
-			reservationTaken = true
-			frontierMu.Unlock()
 		}
 
 		tasksWG.Add(1)
@@ -982,6 +696,9 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				}
 
 				if err != nil {
+					if frontierEntryID != 0 {
+						_ = fs.Retry(frontierEntryID, err)
+					}
 					return fmt.Errorf("stage %s: %w", stageName, err)
 				}
 
@@ -1001,12 +718,17 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 				for _, nextStage := range edges[stageName] {
 					for _, item := range out {
-						if err := enqueue(nextStage, item, hops+1); err != nil {
+						if err := enqueueGuarded(nextStage, item, hops+1); err != nil {
 							return fmt.Errorf("enqueue to %s: %w", nextStage, err)
 						}
 					}
 				}
 
+				if frontierEntryID != 0 {
+					if err := fs.Ack(frontierEntryID); err != nil {
+						return fmt.Errorf("frontier ack: %w", err)
+					}
+				}
 				return nil
 			},
 		}
@@ -1014,21 +736,9 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		select {
 		case <-ctx.Done():
 			tasksWG.Done()
-			frontierMu.Lock()
-			if reservationTaken {
-				reservedJobs--
-			}
-			rollbackDedup()
-			frontierMu.Unlock()
 			return ctx.Err()
 
 		case stageJobs <- job:
-			frontierMu.Lock()
-			if reservationTaken {
-				reservedJobs--
-			}
-			acceptedJobs++
-			frontierMu.Unlock()
 			return nil
 		}
 
@@ -1036,7 +746,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 	for stageName, inputs := range seeds {
 		for _, input := range inputs {
-			if err := enqueue(stageName, input, 0); err != nil {
+			if err := enqueueGuarded(stageName, input, 0); err != nil {
 				recordErr(fmt.Errorf("enqueue seed %s: %w", stageName, err))
 			}
 		}
@@ -1047,7 +757,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		go func(trigger Trigger[T]) {
 			defer triggersWG.Done()
 			emit := func(item T) error {
-				if err := enqueue(trigger.Stage(), item, 0); err != nil {
+				if err := enqueueGuarded(trigger.Stage(), item, 0); err != nil {
 					return fmt.Errorf("trigger enqueue %s: %w", trigger.Name(), err)
 				}
 				return nil
@@ -1086,7 +796,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}(trigger)
 	}
 
-	shedulerWG.Wait()
 	triggersWG.Wait()
 	tasksWG.Wait()
 	for _, jobsCh := range jobsByStage {

@@ -77,6 +77,18 @@ func TestWithCycleModeSetsOptions(t *testing.T) {
 	}
 }
 
+func TestWithFrontierSetsOption(t *testing.T) {
+	opts := defaultOptions[int]()
+	if opts.UseFrontier {
+		t.Fatal("expected default frontier mode disabled")
+	}
+
+	WithFrontier[int](true)(opts)
+	if !opts.UseFrontier {
+		t.Fatal("expected frontier mode enabled")
+	}
+}
+
 func TestWithStageWorkersSetsCopiedMap(t *testing.T) {
 	opts := defaultOptions[int]()
 	in := map[string]int{"a": 2}
