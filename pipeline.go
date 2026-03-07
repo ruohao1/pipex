@@ -225,6 +225,12 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	reservedJobs := 0
 	seen := make(map[string]struct{})
 	var seenMu sync.Mutex
+	var frontierStatsWG sync.WaitGroup
+	stopFrontierStats := func() {}
+	defer func() {
+		stopFrontierStats()
+		frontierStatsWG.Wait()
+	}()
 
 	limiters := map[string]*rate.Limiter{}
 	for stageName, cfg := range runOpts.StageRateLimits {
@@ -274,6 +280,43 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 		fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
 		defer func() { _ = fs.Close() }()
+
+		if runOpts.FrontierStatsInterval > 0 {
+			if statsProvider, ok := fs.(frontier.StatsProvider); ok {
+				statsCtx, statsCancel := context.WithCancel(runCtx)
+				stopFrontierStats = statsCancel
+				frontierStatsWG.Go(func() {
+					emit := func() {
+						stats := statsProvider.Stats()
+						iruntime.Call2(runOpts.Hooks.FrontierStats, runCtx, FrontierStatsEvent{
+							RunID:             runID,
+							Pending:           stats.Pending,
+							Inflight:          stats.Inflight,
+							Acked:             stats.Acked,
+							Retried:           stats.Retried,
+							Dropped:           stats.Dropped,
+							TerminalFailed:    stats.TerminalFailed,
+							Canceled:          stats.Canceled,
+							EnqueueFull:       stats.EnqueueFull,
+							PendingQueueDepth: stats.PendingQueueDepth,
+							At:                time.Now(),
+						})
+					}
+
+					emit()
+					ticker := time.NewTicker(runOpts.FrontierStatsInterval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-statsCtx.Done():
+							return
+						case <-ticker.C:
+							emit()
+						}
+					}
+				})
+			}
+		}
 	}
 	type frontierBlockingEnqueuer interface {
 		EnqueueWait(ctx context.Context, stage string, item T, hops int) (id uint64, err error)
@@ -591,7 +634,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 		tasksWG.Add(1)
 		job := Job{
-			Name: fmt.Sprintf("%s_%v", stageName, in),
+			Name: stageName, // Kill per-job fmt.Sprintf in hot path
 			Run: func(_ context.Context) error {
 				defer tasksWG.Done()
 				if frontierEntryID != 0 {
@@ -815,19 +858,15 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	}
 
 	var schedulerWG sync.WaitGroup
+
 	schedulerWG.Go(func() {
 		if !useFrontier {
 			return
 		}
-		batchSize := runOpts.BufferSize
-		if batchSize < 1 {
-			batchSize = 1
-		}
-		if batchSize > 64 {
-			batchSize = 64
-		}
+		batchSize := min(64, max(1, runOpts.BufferSize))
+		batchBuf := make([]frontier.Entry[T], 0, batchSize)
 		type frontierBatchReserver interface {
-			ReserveBatch(ctx context.Context, max int) ([]frontier.Entry[T], bool, error)
+			ReserveInto(ctx context.Context, dst []frontier.Entry[T], max int) ([]frontier.Entry[T], bool, error)
 		}
 		batchReserver, hasBatchReserver := fs.(frontierBatchReserver)
 
@@ -886,7 +925,8 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 		for {
 			if hasBatchReserver {
-				entries, ok, err := batchReserver.ReserveBatch(runCtx, batchSize)
+				batchBuf = batchBuf[:0]
+				entries, ok, err := batchReserver.ReserveInto(runCtx, batchBuf, batchSize)
 				if err != nil {
 					if isContextErr(err) {
 						return

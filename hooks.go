@@ -50,6 +50,7 @@ type Hooks[T any] struct {
 	FrontierReserve func(ctx context.Context, e FrontierReserveEvent[T])
 	FrontierAck     func(ctx context.Context, e FrontierAckEvent[T])
 	FrontierRetry   func(ctx context.Context, e FrontierRetryEvent[T])
+	FrontierStats   func(ctx context.Context, e FrontierStatsEvent)
 }
 
 // Stage events
@@ -267,4 +268,18 @@ type FrontierRetryEvent[T any] struct {
 	Attempt int
 	Err     error
 	At      time.Time
+}
+
+type FrontierStatsEvent struct {
+	RunID             string
+	Pending           int64
+	Inflight          int64
+	Acked             int64
+	Retried           int64
+	Dropped           int64
+	TerminalFailed    int64
+	Canceled          int64
+	EnqueueFull       int64
+	PendingQueueDepth int
+	At                time.Time
 }

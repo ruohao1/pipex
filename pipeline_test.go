@@ -1909,3 +1909,34 @@ func TestRunFrontierFailFastCancellationDoesNotHangWithPendingEntries(t *testing
 		t.Fatal("run appears stuck under fail-fast cancellation with pending frontier entries")
 	}
 }
+
+func TestRunFrontierStatsHookSampled(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			time.Sleep(5 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+
+	var samples atomic.Int64
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2, 3, 4}},
+		WithFrontier[int](true),
+		WithFrontierStatsInterval[int](1*time.Millisecond),
+		WithHooks[int](Hooks[int]{
+			FrontierStats: func(ctx context.Context, e FrontierStatsEvent) {
+				samples.Add(1)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if samples.Load() == 0 {
+		t.Fatal("expected at least one frontier stats sample")
+	}
+}

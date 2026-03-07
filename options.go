@@ -11,6 +11,7 @@ type RunOptions[T any] struct {
 	UseFrontier             bool
 	FrontierPendingCap      int
 	FrontierBlockingEnqueue bool
+	FrontierStatsInterval   time.Duration
 	Triggers                []Trigger[T]
 	Sinks                   []Sink[T]
 	Hooks                   Hooks[T]
@@ -71,6 +72,7 @@ func defaultOptions[T any]() *RunOptions[T] {
 		UseFrontier:             false,
 		FrontierPendingCap:      0,
 		FrontierBlockingEnqueue: false,
+		FrontierStatsInterval:   0,
 		Triggers:                []Trigger[T]{},
 		Sinks:                   []Sink[T]{},
 		Hooks:                   Hooks[T]{},
@@ -127,6 +129,18 @@ func WithFrontierPendingCapacity[T any](n int) Option[T] {
 func WithFrontierBlockingEnqueue[T any](enabled bool) Option[T] {
 	return func(opts *RunOptions[T]) {
 		opts.FrontierBlockingEnqueue = enabled
+	}
+}
+
+// WithFrontierStatsInterval configures sampled frontier stats emission interval.
+// Values <= 0 disable sampled frontier stats.
+func WithFrontierStatsInterval[T any](interval time.Duration) Option[T] {
+	return func(opts *RunOptions[T]) {
+		if interval <= 0 {
+			opts.FrontierStatsInterval = 0
+			return
+		}
+		opts.FrontierStatsInterval = interval
 	}
 }
 

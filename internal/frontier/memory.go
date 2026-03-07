@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,6 +15,15 @@ type MemoryStore[T any] struct {
 	states   map[uint64]EntryState
 	dropped  map[uint64]struct{}
 	closed   bool
+
+	pendingCount        atomic.Int64
+	inflightCount       atomic.Int64
+	ackedCount          atomic.Int64
+	retriedCount        atomic.Int64
+	droppedCount        atomic.Int64
+	terminalFailedCount atomic.Int64
+	canceledCount       atomic.Int64
+	enqueueFullCount    atomic.Int64
 
 	pendingCh chan Entry[T]
 	closedCh  chan struct{}
@@ -39,6 +49,20 @@ func (s *MemoryStore[T]) StateCounts() map[EntryState]int {
 		counts[st]++
 	}
 	return counts
+}
+
+func (s *MemoryStore[T]) Stats() Stats {
+	return Stats{
+		Pending:           s.pendingCount.Load(),
+		Inflight:          s.inflightCount.Load(),
+		Acked:             s.ackedCount.Load(),
+		Retried:           s.retriedCount.Load(),
+		Dropped:           s.droppedCount.Load(),
+		TerminalFailed:    s.terminalFailedCount.Load(),
+		Canceled:          s.canceledCount.Load(),
+		EnqueueFull:       s.enqueueFullCount.Load(),
+		PendingQueueDepth: len(s.pendingCh),
+	}
 }
 
 func NewMemoryStore[T any]() *MemoryStore[T] {
@@ -89,8 +113,10 @@ func (s *MemoryStore[T]) Enqueue(stage string, item T, hops int) (id uint64, err
 	case s.pendingCh <- entry:
 		s.nextID++
 		s.states[entry.ID] = StatePending
+		s.pendingCount.Add(1)
 		return entry.ID, nil
 	default:
+		s.enqueueFullCount.Add(1)
 		return 0, ErrPendingQueueFull
 	}
 }
@@ -124,9 +150,11 @@ func (s *MemoryStore[T]) EnqueueWait(ctx context.Context, stage string, item T, 
 		case s.pendingCh <- entry:
 			s.nextID++
 			s.states[entry.ID] = StatePending
+			s.pendingCount.Add(1)
 			s.mu.Unlock()
 			return entry.ID, nil
 		default:
+			s.enqueueFullCount.Add(1)
 			s.mu.Unlock()
 		}
 
@@ -181,17 +209,22 @@ func (s *MemoryStore[T]) Reserve(ctx context.Context) (Entry[T], bool, error) {
 	}
 }
 
-func (s *MemoryStore[T]) ReserveBatch(ctx context.Context, max int) ([]Entry[T], bool, error) {
+func (s *MemoryStore[T]) ReserveInto(ctx context.Context, dst []Entry[T], max int) ([]Entry[T], bool, error) {
 	if max <= 0 {
 		max = 1
 	}
+
+	entries := dst[:0]
+
+	// Preserve Reserve semantics for the first item: block until work,
+	// close, or context cancellation.
 	first, ok, err := s.Reserve(ctx)
 	if err != nil || !ok {
-		return nil, ok, err
+		return entries, ok, err
 	}
-
-	entries := make([]Entry[T], 0, max)
 	entries = append(entries, first)
+
+	// Best-effort non-blocking drain for the rest of the batch.
 	for len(entries) < max {
 		select {
 		case entry := <-s.pendingCh:
@@ -201,20 +234,23 @@ func (s *MemoryStore[T]) ReserveBatch(ctx context.Context, max int) ([]Entry[T],
 				s.mu.Unlock()
 				continue
 			}
-			st, ok := s.states[entry.ID]
-			if !ok {
+			st, exists := s.states[entry.ID]
+			if !exists {
 				s.mu.Unlock()
-				return nil, false, fmt.Errorf("%w: id=%d", ErrNotFound, entry.ID)
+				return entries, false, fmt.Errorf("%w: id=%d", ErrNotFound, entry.ID)
 			}
 			if st != StatePending {
 				s.mu.Unlock()
-				return nil, false, fmt.Errorf("%w: id=%d, expected state=%d, actual state=%d", ErrInvalidStateTransition, entry.ID, StatePending, st)
+				return entries, false, fmt.Errorf(
+					"%w: id=%d, expected state=%d, actual state=%d",
+					ErrInvalidStateTransition, entry.ID, StatePending, st,
+				)
 			}
 			s.inflight[entry.ID] = entry
-			var err error
-			if entry, err = s.transition(entry.ID, StatePending, StateReserved); err != nil {
+			var trErr error
+			if entry, trErr = s.transition(entry.ID, StatePending, StateReserved); trErr != nil {
 				s.mu.Unlock()
-				return nil, false, err
+				return entries, false, trErr
 			}
 			s.mu.Unlock()
 			entries = append(entries, entry)
@@ -222,7 +258,12 @@ func (s *MemoryStore[T]) ReserveBatch(ctx context.Context, max int) ([]Entry[T],
 			return entries, true, nil
 		}
 	}
+
 	return entries, true, nil
+}
+
+func (s *MemoryStore[T]) ReserveBatch(ctx context.Context, max int) ([]Entry[T], bool, error) {
+	return s.ReserveInto(ctx, nil, max)
 }
 
 func (s *MemoryStore[T]) DrainPending() int {
@@ -272,8 +313,12 @@ func (s *MemoryStore[T]) Retry(id uint64, cause error) error {
 	case s.pendingCh <- entry:
 		delete(s.inflight, id)
 		s.states[id] = StatePending
+		s.retriedCount.Add(1)
+		s.inflightCount.Add(-1)
+		s.pendingCount.Add(1)
 		return nil
 	default:
+		s.enqueueFullCount.Add(1)
 		return ErrPendingQueueFull
 	}
 }
@@ -305,6 +350,20 @@ func (s *MemoryStore[T]) transition(id uint64, from, to EntryState) (Entry[T], e
 	entry.State = to
 	s.states[id] = to
 	s.inflight[id] = entry
+	switch {
+	case from == StatePending && to == StateReserved:
+		s.pendingCount.Add(-1)
+		s.inflightCount.Add(1)
+	case from == StateReserved && to == StateAcked:
+		s.inflightCount.Add(-1)
+		s.ackedCount.Add(1)
+	case from == StateReserved && to == StateCanceled:
+		s.inflightCount.Add(-1)
+		s.canceledCount.Add(1)
+	case from == StateReserved && to == StateTerminalFailed:
+		s.inflightCount.Add(-1)
+		s.terminalFailedCount.Add(1)
+	}
 	if to == StateAcked || to == StateCanceled || to == StateDropped || to == StateTerminalFailed {
 		delete(s.inflight, id)
 		s.recordTerminalStateLocked(id)
@@ -345,6 +404,8 @@ func (s *MemoryStore[T]) MarkDropped(id uint64) error {
 		}
 		s.states[id] = StateDropped
 		s.dropped[id] = struct{}{}
+		s.pendingCount.Add(-1)
+		s.droppedCount.Add(1)
 		s.recordTerminalStateLocked(id)
 		return nil
 	}

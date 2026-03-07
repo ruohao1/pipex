@@ -26,7 +26,17 @@ const (
 	StateTerminalFailed
 )
 
-
+type Stats struct {
+	Pending           int64
+	Inflight          int64
+	Acked             int64
+	Retried           int64
+	Dropped           int64
+	TerminalFailed    int64
+	Canceled          int64
+	EnqueueFull       int64
+	PendingQueueDepth int
+}
 
 type Store[T any] interface {
 	// Enqueue adds a new pending entry. Returns ErrClosed if the store has
@@ -42,4 +52,8 @@ type Store[T any] interface {
 	// Close marks the store as closed; future Reserve calls should return
 	// ok=false, err=nil.
 	Close() error
+}
+
+type StatsProvider interface {
+	Stats() Stats
 }

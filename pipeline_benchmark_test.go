@@ -109,6 +109,47 @@ func BenchmarkRunFrontierMode(b *testing.B) {
 			}
 		}
 	})
+
+	b.Run("frontier-on-sampled-stats", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := p.Run(
+				context.Background(),
+				seeds,
+				WithBufferSize[int](256),
+				WithFrontier[int](true),
+				WithFrontierStatsInterval[int](5*time.Millisecond),
+				WithHooks[int](Hooks[int]{
+					FrontierStats: func(ctx context.Context, e FrontierStatsEvent) {},
+				}),
+			); err != nil {
+				b.Fatalf("run failed: %v", err)
+			}
+		}
+	})
+
+	b.Run("frontier-on-per-item-hooks", func(b *testing.B) {
+		hooks := Hooks[int]{
+			FrontierEnqueue: func(ctx context.Context, e FrontierEnqueueEvent[int]) {},
+			FrontierReserve: func(ctx context.Context, e FrontierReserveEvent[int]) {},
+			FrontierAck:     func(ctx context.Context, e FrontierAckEvent[int]) {},
+			FrontierRetry:   func(ctx context.Context, e FrontierRetryEvent[int]) {},
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := p.Run(
+				context.Background(),
+				seeds,
+				WithBufferSize[int](256),
+				WithFrontier[int](true),
+				WithHooks[int](hooks),
+			); err != nil {
+				b.Fatalf("run failed: %v", err)
+			}
+		}
+	})
 }
 
 func BenchmarkRunStageExhaustionParity(b *testing.B) {

@@ -375,3 +375,151 @@ func TestMemoryStoreStateCountsSnapshot(t *testing.T) {
 		t.Fatalf("expected second entry to remain pending, got state=%v ok=%v", st, ok)
 	}
 }
+
+func TestMemoryStoreStatsTransitions(t *testing.T) {
+	s := NewMemoryStore[int]()
+	id, err := s.Enqueue("a", 1, 0)
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	stats := s.Stats()
+	if stats.Pending != 1 || stats.Inflight != 0 {
+		t.Fatalf("unexpected stats after enqueue: %+v", stats)
+	}
+
+	_, ok, err := s.Reserve(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("reserve failed: ok=%v err=%v", ok, err)
+	}
+	stats = s.Stats()
+	if stats.Pending != 0 || stats.Inflight != 1 {
+		t.Fatalf("unexpected stats after reserve: %+v", stats)
+	}
+
+	if err := s.Ack(id); err != nil {
+		t.Fatalf("ack failed: %v", err)
+	}
+	stats = s.Stats()
+	if stats.Inflight != 0 || stats.Acked != 1 {
+		t.Fatalf("unexpected stats after ack: %+v", stats)
+	}
+}
+
+func TestMemoryStoreStatsRetryAndQueueFull(t *testing.T) {
+	s := NewMemoryStoreWithCapacity[int](1)
+	id, err := s.Enqueue("a", 1, 0)
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	if _, err := s.Enqueue("a", 2, 0); !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("expected queue full on second enqueue, got %v", err)
+	}
+	_, ok, err := s.Reserve(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("reserve failed: ok=%v err=%v", ok, err)
+	}
+	if err := s.Retry(id, errors.New("retry")); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+
+	stats := s.Stats()
+	if stats.Retried != 1 || stats.EnqueueFull != 1 || stats.Pending != 1 || stats.Inflight != 0 {
+		t.Fatalf("unexpected stats after retry path: %+v", stats)
+	}
+}
+
+func TestMemoryStoreStatsTerminalMarkers(t *testing.T) {
+	t.Run("dropped", func(t *testing.T) {
+		s := NewMemoryStore[int]()
+		id, err := s.Enqueue("a", 1, 0)
+		if err != nil {
+			t.Fatalf("enqueue failed: %v", err)
+		}
+		if err := s.MarkDropped(id); err != nil {
+			t.Fatalf("mark dropped failed: %v", err)
+		}
+		stats := s.Stats()
+		if stats.Pending != 0 || stats.Dropped != 1 {
+			t.Fatalf("unexpected stats after dropped: %+v", stats)
+		}
+	})
+
+	t.Run("terminal-failed-and-canceled", func(t *testing.T) {
+		s := NewMemoryStore[int]()
+		id1, err := s.Enqueue("a", 1, 0)
+		if err != nil {
+			t.Fatalf("enqueue id1 failed: %v", err)
+		}
+		id2, err := s.Enqueue("a", 2, 0)
+		if err != nil {
+			t.Fatalf("enqueue id2 failed: %v", err)
+		}
+		e1, ok, err := s.Reserve(context.Background())
+		if err != nil || !ok {
+			t.Fatalf("reserve e1 failed: ok=%v err=%v", ok, err)
+		}
+		e2, ok, err := s.Reserve(context.Background())
+		if err != nil || !ok {
+			t.Fatalf("reserve e2 failed: ok=%v err=%v", ok, err)
+		}
+		if e1.ID != id1 || e2.ID != id2 {
+			t.Fatalf("unexpected reserve order: e1=%d e2=%d", e1.ID, e2.ID)
+		}
+		if err := s.MarkTerminalFailed(id1); err != nil {
+			t.Fatalf("mark terminal failed: %v", err)
+		}
+		if err := s.MarkCanceled(id2); err != nil {
+			t.Fatalf("mark canceled: %v", err)
+		}
+		stats := s.Stats()
+		if stats.Inflight != 0 || stats.TerminalFailed != 1 || stats.Canceled != 1 {
+			t.Fatalf("unexpected stats after terminal markers: %+v", stats)
+		}
+	})
+}
+
+func TestMemoryStoreReserveIntoReusesBufferWithoutLeakingOldValues(t *testing.T) {
+	s := NewMemoryStoreWithCapacity[int](4)
+	for _, v := range []int{10, 20, 30} {
+		if _, err := s.Enqueue("a", v, 0); err != nil {
+			t.Fatalf("enqueue failed: %v", err)
+		}
+	}
+
+	dst := make([]Entry[int], 2, 8)
+	dst[0] = Entry[int]{ID: 999, Input: -1}
+	dst[1] = Entry[int]{ID: 1000, Input: -2}
+	dstBacking := dst[:cap(dst)]
+
+	entries, ok, err := s.ReserveInto(context.Background(), dst, 2)
+	if err != nil || !ok {
+		t.Fatalf("reserve into failed: ok=%v err=%v", ok, err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[0].ID != 1 || entries[1].ID != 2 {
+		t.Fatalf("unexpected first batch IDs: %+v", entries)
+	}
+	if entries[0].Input != 10 || entries[1].Input != 20 {
+		t.Fatalf("unexpected first batch inputs: %+v", entries)
+	}
+	entriesBacking := entries[:cap(entries)]
+	if &entriesBacking[0] != &dstBacking[0] {
+		t.Fatal("expected ReserveInto to reuse caller-provided buffer backing array")
+	}
+
+	entries, ok, err = s.ReserveInto(context.Background(), entries[:0], 2)
+	if err != nil || !ok {
+		t.Fatalf("second reserve into failed: ok=%v err=%v", ok, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 remaining entry, got %d", len(entries))
+	}
+	if entries[0].ID != 3 || entries[0].Input != 30 {
+		t.Fatalf("unexpected second batch entry: %+v", entries[0])
+	}
+	if len(entries) > 1 {
+		t.Fatalf("unexpected stale entries leaked in second batch: %+v", entries)
+	}
+}
