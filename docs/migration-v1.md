@@ -1,13 +1,13 @@
-# v1 Migration Guide (Draft)
+# v1 Migration Guide
 
-This guide tracks upgrade changes for `pipex` v1.
+This guide documents upgrade changes introduced in `pipex` v1 and runtime guidance aligned with the current implementation.
 
-## Planned Breaking Changes
+## v1 Breaking Changes (Completed)
 
-1. Remove `CycleModeOptions.DedupKey`.
-2. Change `WithCycleMode(maxHops, maxJobs, dedupKey)` to `WithCycleMode(maxHops, maxJobs)`.
-3. Remove cycle dedup compatibility shim from runtime.
-4. Remove `CycleDedupDrop` hook and standardize on `DedupDrop`.
+1. Removed `CycleModeOptions.DedupKey`.
+2. Changed `WithCycleMode(maxHops, maxJobs, dedupKey)` to `WithCycleMode(maxHops, maxJobs)`.
+3. Removed cycle dedup compatibility shim from runtime.
+4. Removed `CycleDedupDrop` hook and standardized on `DedupDrop`.
 
 ## Migration Summary
 
@@ -57,9 +57,18 @@ After:
 
 If you relied on cycle-specific filtering, filter by dedup scope/stage in your hook handler.
 
+## Runtime Mode Guidance (v1.1+)
+
+`pipex` currently supports two runtime execution modes:
+
+- `WithFrontier(true)`: frontier-backed recoverable scheduling mode (recommended for security workflows).
+- `WithFrontier(false)`: ephemeral direct-dispatch mode (lower overhead baseline and fallback mode).
+
+For long-running scan/crawl/enrichment workflows, prefer frontier mode. For small CPU-bound local transforms where throughput is the only goal, ephemeral mode may be preferable.
+
 ## Validation Checklist
 
-- [ ] Build compiles with new `WithCycleMode` signature.
-- [ ] Dedup behavior preserved using `WithDedupRules(...)`.
-- [ ] Hook consumers migrated from `CycleDedupDrop` to `DedupDrop`.
-- [ ] Test suite and race tests pass.
+- [x] Build compiles with new `WithCycleMode` signature.
+- [x] Dedup behavior preserved using `WithDedupRules(...)`.
+- [x] Hook consumers migrated from `CycleDedupDrop` to `DedupDrop`.
+- [x] Test suite and race tests pass.

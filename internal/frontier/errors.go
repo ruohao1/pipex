@@ -10,4 +10,6 @@ var (
 	ErrClosed           = errors.New("store is closed")
 	ErrNotFound         = errors.New("entry not found")
 	ErrPendingQueueFull = errors.New("pending queue is full")
+
+	ErrInvalidStateTransition = errors.New("invalid state transition")
 )

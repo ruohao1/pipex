@@ -8,7 +8,25 @@ type Entry[T any] struct {
 	Input   T
 	Hops    int
 	Attempt int
+
+	State EntryState
 }
+
+type EntryState int
+
+const (
+	StatePending EntryState = iota
+	StateReserved
+	StateRetried
+
+	// Terminal states
+	StateAcked
+	StateCanceled
+	StateDropped
+	StateTerminalFailed
+)
+
+
 
 type Store[T any] interface {
 	// Enqueue adds a new pending entry. Returns ErrClosed if the store has
