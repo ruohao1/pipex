@@ -77,19 +77,37 @@ This is intended to avoid queue-full failures during bursty workloads.
 
 Frontier mode has overhead compared to the direct path (`WithFrontier(false)`), because dispatch goes through frontier enqueue/reserve/ack.
 
-Recent benchmark snapshot (machine-local, `BenchmarkRunFrontierComprehensive`):
+Latest benchmark snapshot (machine-local, March 7, 2026):
 
-- linear-success-256: frontier-on `+43%` vs frontier-off
-- linear-success-2048: frontier-on `+74%` vs frontier-off
-- fanout-success-512: frontier-on `+113%` vs frontier-off
-- retry-exhaustion-mixed-512: frontier-on `+15%` vs frontier-off
-- sink-slow-256: frontier-on `+7%` vs frontier-off
+Command:
+
+```bash
+go test -run '^$' -bench BenchmarkRunFrontierMode/frontier-on -benchmem -count=5 ./...
+```
+
+Environment:
+
+- `goos=linux`
+- `goarch=amd64`
+- CPU: `13th Gen Intel(R) Core(TM) i7-1360P`
+
+Median results:
+
+- `frontier-on`: `2,014,925 ns/op`, `291,112 B/op`, `1,170 allocs/op`
+- `frontier-on-sampled-stats`: `2,402,678 ns/op` (`+19.2%` vs frontier-on), `289,774 B/op`, `1,180 allocs/op`
+- `frontier-on-per-item-hooks`: `2,202,945 ns/op` (`+9.3%` vs frontier-on), `290,081 B/op`, `1,170 allocs/op`
+
+Compared with the earlier local `frontier-on` median (`2,665,843 ns/op`, `319,597 B/op`, `2,205 allocs/op`), current runtime is approximately:
+
+- `~24.4%` faster (`ns/op`)
+- `~8.9%` lower memory (`B/op`)
+- `~46.9%` fewer allocations (`allocs/op`)
 
 Interpretation:
 
-- overhead is most visible in CPU-bound, high-fanout workloads
-- overhead is less visible when downstream I/O dominates
-- blocking enqueue mode can be significantly slower and should be enabled only when you need strict enqueue blocking semantics
+- frontier bookkeeping still dominates overhead versus direct dispatch
+- sampled frontier stats are materially cheaper than baseline frontier cost, but are not free
+- per-item hooks add overhead and should be enabled selectively in production
 
 ## When To Use It
 
@@ -106,6 +124,29 @@ Frontier mode works alongside normal runtime options:
 - `WithCycleMode(maxHops, maxJobs)`
 - `WithFailFast(...)`
 - `WithPartialResults(...)`
+- `WithFrontierStatsInterval(...)`
+
+## Recommended Defaults
+
+For production-style security workflows, start with:
+
+- `WithFrontier(true)`
+- `WithBufferSize(256)` (or higher for bursty fanout)
+- leave `WithFrontierPendingCapacity(...)` unset first (auto sizing), then tune with `FrontierStats` data
+- `WithFrontierStatsInterval(250 * time.Millisecond)` for low-cost runtime visibility
+- keep per-item frontier hooks disabled by default unless needed for debugging
+
+Example:
+
+```go
+res, err := p.Run(
+	context.Background(),
+	seeds,
+	pipex.WithFrontier[int](true),
+	pipex.WithBufferSize[int](256),
+	pipex.WithFrontierStatsInterval[int](250*time.Millisecond),
+)
+```
 
 ## Current Scope
 
@@ -137,3 +178,4 @@ Use hooks for frontier observability:
 - `FrontierReserve`
 - `FrontierAck`
 - `FrontierRetry`
+- `FrontierStats` (sampled snapshot; enabled via `WithFrontierStatsInterval(...)`)

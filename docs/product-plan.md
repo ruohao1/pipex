@@ -60,9 +60,11 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 - [x] Make memory frontier enqueue/close behavior deterministic.
 - [x] Preserve inflight entries on retry backpressure (`ErrPendingQueueFull`).
 - [x] Add parity and frontier-focused benchmark coverage.
-- [ ] Define explicit frontier execution-state model (`pending`, `reserved`, `acked`, `retried`, `terminal_failed`, `dropped`, `canceled`).
+- [x] Define explicit frontier execution-state model (`pending`, `reserved`, `acked`, `retried`, `terminal_failed`, `dropped`, `canceled`).
 - [ ] Add terminal failure recording/reporting path (beyond ack/retry only).
-- [ ] Add frontier runtime metrics surface (queue depth, inflight, retries, per-stage backlog).
+- [x] Add sampled frontier runtime stats surface (queue depth, inflight, retries, enqueue pressure) via `WithFrontierStatsInterval(...)` + `FrontierStats` hook.
+- [ ] Add per-stage backlog metrics (remaining runtime metrics gap).
+- [x] Reduce frontier hot-path allocations by reusing reserve batch buffers and removing per-job string formatting in enqueue path.
 - [ ] Stabilize blocking enqueue mode under retry-heavy contention and re-enable it in all benchmark scenarios.
 
 ## Feature Tracks
