@@ -44,15 +44,30 @@ type RunHandle struct {
 	totalPaused time.Duration
 	pausedSince time.Time
 	hooks       RunHandleHooks
+
+	hookEvents chan runHookEvent
+	hookWG     sync.WaitGroup
+	hookStop   sync.Once
 }
 
 func NewRunHandle(runID string, cancel context.CancelFunc) *RunHandle {
-	return &RunHandle{
+	h := &RunHandle{
 		runID:  runID,
 		state:  RunStateRunning,
 		now:    time.Now,
 		cancel: cancel,
+		// Control transitions are low frequency; this buffer avoids blocking
+		// most call paths while preserving FIFO hook order.
+		hookEvents: make(chan runHookEvent, 64),
 	}
+	h.hookWG.Add(1)
+	go func() {
+		defer h.hookWG.Done()
+		for ev := range h.hookEvents {
+			h.dispatchHookEvent(ev)
+		}
+	}()
+	return h
 }
 
 func (h *RunHandle) SetCancel(cancel context.CancelFunc) {
@@ -78,11 +93,11 @@ func (h *RunHandle) Pause() bool {
 	h.pauseCount++
 	h.pausedSince = h.now()
 	snap := h.statusLocked(h.now())
-	onPause := h.hooks.OnPause
+	h.emitHookEventLocked(runHookEvent{
+		kind: runHookPause,
+		snap: snap,
+	})
 	h.mu.Unlock()
-	if onPause != nil {
-		onPause(snap)
-	}
 	return true
 }
 
@@ -100,11 +115,11 @@ func (h *RunHandle) Resume() bool {
 	h.resumeCount++
 	h.state = RunStateRunning
 	snap := h.statusLocked(h.now())
-	onResume := h.hooks.OnResume
+	h.emitHookEventLocked(runHookEvent{
+		kind: runHookResume,
+		snap: snap,
+	})
 	h.mu.Unlock()
-	if onResume != nil {
-		onResume(snap)
-	}
 	return true
 }
 
@@ -128,6 +143,7 @@ func (h *RunHandle) Cancel() bool {
 	if cancel != nil {
 		cancel()
 	}
+	h.stopHookDispatcher()
 	return true
 }
 
@@ -144,6 +160,7 @@ func (h *RunHandle) MarkCompleted() bool {
 		h.pausedSince = time.Time{}
 	}
 	h.state = RunStateCompleted
+	go h.stopHookDispatcher()
 	return true
 }
 
@@ -167,4 +184,45 @@ func (h *RunHandle) statusLocked(now time.Time) RunStatus {
 		status.CurrentPauseStart = h.pausedSince
 	}
 	return status
+}
+
+type runHookKind int
+
+const (
+	runHookPause runHookKind = iota
+	runHookResume
+)
+
+type runHookEvent struct {
+	kind runHookKind
+	snap RunStatus
+}
+
+func (h *RunHandle) emitHookEventLocked(ev runHookEvent) {
+	// Called with h.mu held so transition order maps to channel send order.
+	h.hookEvents <- ev
+}
+
+func (h *RunHandle) dispatchHookEvent(ev runHookEvent) {
+	h.mu.Lock()
+	hooks := h.hooks
+	h.mu.Unlock()
+
+	switch ev.kind {
+	case runHookPause:
+		if hooks.OnPause != nil {
+			hooks.OnPause(ev.snap)
+		}
+	case runHookResume:
+		if hooks.OnResume != nil {
+			hooks.OnResume(ev.snap)
+		}
+	}
+}
+
+func (h *RunHandle) stopHookDispatcher() {
+	h.hookStop.Do(func() {
+		close(h.hookEvents)
+		h.hookWG.Wait()
+	})
 }

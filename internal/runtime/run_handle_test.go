@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -107,18 +108,21 @@ func TestRunHandle_PauseDurationTelemetry(t *testing.T) {
 func TestRunHandle_PauseResumeHooks(t *testing.T) {
 	h := NewRunHandle("r5", nil)
 	var paused, resumed atomic.Int64
+	done := make(chan struct{}, 2)
 	h.SetHooks(RunHandleHooks{
 		OnPause: func(st RunStatus) {
 			paused.Add(1)
 			if st.State != RunStatePaused {
 				t.Fatalf("pause hook state=%s", st.State)
 			}
+			done <- struct{}{}
 		},
 		OnResume: func(st RunStatus) {
 			resumed.Add(1)
 			if st.State != RunStateRunning {
 				t.Fatalf("resume hook state=%s", st.State)
 			}
+			done <- struct{}{}
 		},
 	})
 
@@ -128,7 +132,68 @@ func TestRunHandle_PauseResumeHooks(t *testing.T) {
 	if !h.Resume() {
 		t.Fatal("resume should succeed")
 	}
+	waitForN(t, done, 2, time.Second)
 	if paused.Load() != 1 || resumed.Load() != 1 {
 		t.Fatalf("unexpected hook counts paused=%d resumed=%d", paused.Load(), resumed.Load())
+	}
+}
+
+func TestRunHandle_HookOrderConcurrentPauseResume(t *testing.T) {
+	h := NewRunHandle("r6", nil)
+	var (
+		mu     sync.Mutex
+		events []RunState
+	)
+	done := make(chan struct{}, 2)
+	h.SetHooks(RunHandleHooks{
+		OnPause: func(st RunStatus) {
+			mu.Lock()
+			events = append(events, st.State)
+			mu.Unlock()
+			done <- struct{}{}
+		},
+		OnResume: func(st RunStatus) {
+			mu.Lock()
+			events = append(events, st.State)
+			mu.Unlock()
+			done <- struct{}{}
+		},
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = h.Pause()
+	}()
+	go func() {
+		defer wg.Done()
+		deadline := time.Now().Add(200 * time.Millisecond)
+		for !h.Resume() && time.Now().Before(deadline) {
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+	wg.Wait()
+	waitForN(t, done, 2, time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d (%v)", len(events), events)
+	}
+	if events[0] != RunStatePaused || events[1] != RunStateRunning {
+		t.Fatalf("unexpected hook order: %v", events)
+	}
+}
+
+func waitForN(t *testing.T, ch <-chan struct{}, n int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for i := 0; i < n; i++ {
+		select {
+		case <-ch:
+		case <-deadline:
+			t.Fatalf("timeout waiting for %d events (received %d)", n, i)
+		}
 	}
 }
