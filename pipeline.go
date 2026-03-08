@@ -692,75 +692,12 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		}
 	})
 
-	for stageName, inputs := range seeds {
-		for _, input := range inputs {
-			if err := enqueueGuarded(stageName, input, 0); err != nil {
-				recordErr(fmt.Errorf("enqueue seed %s: %w", stageName, err))
-			}
-		}
-	}
-
-	for _, trigger := range runOpts.Triggers {
-		triggersWG.Add(1)
-		go func(trigger Trigger[T]) {
-			defer triggersWG.Done()
-			emit := func(item T) error {
-				if err := enqueueGuarded(trigger.Stage(), item, 0); err != nil {
-					return fmt.Errorf("trigger enqueue %s: %w", trigger.Name(), err)
-				}
-				return nil
-			}
-			startTime := time.Now()
-			iruntime.Call2(runOpts.Hooks.TriggerStart, runCtx, TriggerStartEvent[T]{
-				RunID:     runID,
-				Trigger:   trigger.Name(),
-				Stage:     trigger.Stage(),
-				StartedAt: startTime,
-			})
-			err := trigger.Start(ctx, emit)
-			finishTime := time.Now()
-			duration := finishTime.Sub(startTime)
-			if err != nil {
-				iruntime.Call2(runOpts.Hooks.TriggerError, runCtx, TriggerErrorEvent[T]{
-					RunID:      runID,
-					Trigger:    trigger.Name(),
-					Stage:      trigger.Stage(),
-					StartedAt:  startTime,
-					FinishedAt: finishTime,
-					Duration:   duration,
-					Err:        err,
-				})
-				recordErr(fmt.Errorf("trigger %s: %w", trigger.Name(), err))
-				return
-			}
-			iruntime.Call2(runOpts.Hooks.TriggerEnd, runCtx, TriggerEndEvent[T]{
-				RunID:      runID,
-				Trigger:    trigger.Name(),
-				Stage:      trigger.Stage(),
-				StartedAt:  startTime,
-				FinishedAt: finishTime,
-				Duration:   duration,
-			})
-		}(trigger)
-	}
+	enqueueSeeds(seeds, enqueueGuarded, recordErr)
+	startTriggerWorkers(ctx, runCtx, runID, runOpts, enqueueGuarded, &triggersWG, recordErr)
 
 	triggersWG.Wait()
 	if useFrontier {
-		waitDone := make(chan struct{})
-		go func() {
-			frontierOutstandingWG.Wait()
-			close(waitDone)
-		}()
-		select {
-		case <-waitDone:
-		case <-runCtx.Done():
-		}
-		_ = fs.Close()
-		if drainer, ok := fs.(interface{ DrainPending() int }); ok {
-			for i := 0; i < drainer.DrainPending(); i++ {
-				frontierOutstandingWG.Done()
-			}
-		}
+		waitForFrontierOutstanding(runCtx, fs, &frontierOutstandingWG)
 		schedulerWG.Wait()
 	}
 	tasksWG.Wait()
@@ -1122,6 +1059,92 @@ func startStagePools[T any](
 				recordErr(err)
 			}
 		}(poolErrCh)
+	}
+}
+
+func enqueueSeeds[T any](
+	seeds map[string][]T,
+	enqueueGuarded func(stageName string, in T, hops int) error,
+	recordErr func(error),
+) {
+	for stageName, inputs := range seeds {
+		for _, input := range inputs {
+			if err := enqueueGuarded(stageName, input, 0); err != nil {
+				recordErr(fmt.Errorf("enqueue seed %s: %w", stageName, err))
+			}
+		}
+	}
+}
+
+func startTriggerWorkers[T any](
+	ctx context.Context,
+	runCtx context.Context,
+	runID string,
+	runOpts *RunOptions[T],
+	enqueueGuarded func(stageName string, in T, hops int) error,
+	triggersWG *sync.WaitGroup,
+	recordErr func(error),
+) {
+	for _, trigger := range runOpts.Triggers {
+		triggersWG.Add(1)
+		go func(trigger Trigger[T]) {
+			defer triggersWG.Done()
+			emit := func(item T) error {
+				if err := enqueueGuarded(trigger.Stage(), item, 0); err != nil {
+					return fmt.Errorf("trigger enqueue %s: %w", trigger.Name(), err)
+				}
+				return nil
+			}
+			startTime := time.Now()
+			iruntime.Call2(runOpts.Hooks.TriggerStart, runCtx, TriggerStartEvent[T]{
+				RunID:     runID,
+				Trigger:   trigger.Name(),
+				Stage:     trigger.Stage(),
+				StartedAt: startTime,
+			})
+			err := trigger.Start(ctx, emit)
+			finishTime := time.Now()
+			duration := finishTime.Sub(startTime)
+			if err != nil {
+				iruntime.Call2(runOpts.Hooks.TriggerError, runCtx, TriggerErrorEvent[T]{
+					RunID:      runID,
+					Trigger:    trigger.Name(),
+					Stage:      trigger.Stage(),
+					StartedAt:  startTime,
+					FinishedAt: finishTime,
+					Duration:   duration,
+					Err:        err,
+				})
+				recordErr(fmt.Errorf("trigger %s: %w", trigger.Name(), err))
+				return
+			}
+			iruntime.Call2(runOpts.Hooks.TriggerEnd, runCtx, TriggerEndEvent[T]{
+				RunID:      runID,
+				Trigger:    trigger.Name(),
+				Stage:      trigger.Stage(),
+				StartedAt:  startTime,
+				FinishedAt: finishTime,
+				Duration:   duration,
+			})
+		}(trigger)
+	}
+}
+
+func waitForFrontierOutstanding[T any](runCtx context.Context, fs frontier.Store[T], frontierOutstandingWG *sync.WaitGroup) {
+	waitDone := make(chan struct{})
+	go func() {
+		frontierOutstandingWG.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-runCtx.Done():
+	}
+	_ = fs.Close()
+	if drainer, ok := fs.(interface{ DrainPending() int }); ok {
+		for i := 0; i < drainer.DrainPending(); i++ {
+			frontierOutstandingWG.Done()
+		}
 	}
 }
 
