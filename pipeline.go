@@ -198,18 +198,16 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			seenMu.Unlock()
 		}
 
-			if dedupRules, ok := dedupRulesByStage[stageName]; ok {
-				for _, rule := range dedupRules {
-					dedupKeyValue, derr := iruntime.SafeStringKey(rule.Key, in)
-					if derr != nil {
-						rollbackDedup()
-						return derr
-					}
+		if dedupRules, ok := dedupRulesByStage[stageName]; ok {
+			for _, rule := range dedupRules {
+				dedupKeyValue, derr := iruntime.SafeStringKey(rule.Key, in)
+				if derr != nil {
+					rollbackDedup()
+					return derr
+				}
 				key = stageName + "\x00" + dedupKeyValue
 				dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
-				seenMu.Lock()
-				if _, exists := seen[dedupMapKey]; exists {
-					seenMu.Unlock()
+				if iruntime.SeenContainsOrInsert(&seenMu, seen, dedupMapKey) {
 					iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
 						RunID: runID,
 						Item:  in,
@@ -219,15 +217,21 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					})
 					return nil
 				}
-				seen[dedupMapKey] = struct{}{}
 				dedupInsertedKeys = append(dedupInsertedKeys, dedupMapKey)
-				seenMu.Unlock()
 			}
 		}
 		if runOpts.CycleMode.Enabled {
 			at := time.Now()
 			frontierMu.Lock()
-			if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
+			switch iruntime.EvaluateCycleGate(
+				runOpts.CycleMode.Enabled,
+				runOpts.CycleMode.MaxHops,
+				runOpts.CycleMode.MaxJobs,
+				hops,
+				acceptedJobs,
+				reservedJobs,
+			) {
+			case iruntime.CycleGateDropHopLimit:
 				rollbackDedup()
 				frontierMu.Unlock()
 				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
@@ -238,10 +242,8 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 					MaxHops: runOpts.CycleMode.MaxHops,
 					At:      at,
 				})
-
 				return nil
-			}
-			if acceptedJobs+reservedJobs >= runOpts.CycleMode.MaxJobs {
+			case iruntime.CycleGateRejectMaxJobs:
 				rollbackDedup()
 				frontierMu.Unlock()
 				iruntime.Call2(runOpts.Hooks.CycleMaxJobsExceeded, runCtx, CycleMaxJobsExceededEvent[T]{
@@ -254,7 +256,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				})
 				return CycleModeMaxJobsExceeded(runOpts.CycleMode.MaxJobs)
 			}
-
 			reservedJobs++
 			reservationTaken = true
 			frontierMu.Unlock()
