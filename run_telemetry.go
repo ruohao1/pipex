@@ -6,6 +6,15 @@ import (
 	iruntime "github.com/ruohao1/pipex/internal/runtime"
 )
 
+type RunState string
+
+const (
+	RunStateRunning   RunState = "running"
+	RunStatePaused    RunState = "paused"
+	RunStateCanceled  RunState = "canceled"
+	RunStateCompleted RunState = "completed"
+)
+
 // RunTelemetry is a public snapshot of run lifecycle telemetry.
 type RunTelemetry struct {
 	RunID             string
@@ -14,7 +23,7 @@ type RunTelemetry struct {
 	TotalPaused       time.Duration
 	CurrentlyPaused   bool
 	CurrentPauseStart time.Time
-	LastState         string
+	LastState         RunState
 	UpdatedAt         time.Time
 }
 
@@ -46,7 +55,7 @@ func toPublicRunTelemetry(tm iruntime.RunTelemetry) RunTelemetry {
 		TotalPaused:       tm.TotalPaused,
 		CurrentlyPaused:   tm.CurrentlyPaused,
 		CurrentPauseStart: tm.CurrentPauseStart,
-		LastState:         string(tm.LastState),
+		LastState:         RunState(tm.LastState),
 		UpdatedAt:         tm.UpdatedAt,
 	}
 }

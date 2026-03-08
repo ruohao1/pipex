@@ -31,8 +31,8 @@ func TestGetRunTelemetry_Present(t *testing.T) {
 	if tm.CurrentlyPaused {
 		t.Fatal("expected currently paused=false after resume")
 	}
-	if tm.LastState != "running" {
-		t.Fatalf("last state=%s want=running", tm.LastState)
+	if tm.LastState != RunStateRunning {
+		t.Fatalf("last state=%s want=%s", tm.LastState, RunStateRunning)
 	}
 }
 
@@ -60,5 +60,23 @@ func TestGetRunTelemetrySnapshot_ActiveOnly(t *testing.T) {
 	}
 	if _, ok := snap["public-active-running"]; !ok {
 		t.Fatal("expected running run to be included")
+	}
+}
+
+func TestGetRunTelemetry_AfterCancel(t *testing.T) {
+	h := iruntime.NewRunHandle("public-cancel-telemetry", nil)
+	iruntime.RegisterRunHandle("public-cancel-telemetry", h)
+	defer iruntime.UnregisterRunHandle("public-cancel-telemetry")
+
+	if !CancelRun("public-cancel-telemetry") {
+		t.Fatal("cancel should succeed")
+	}
+
+	tm, ok := GetRunTelemetry("public-cancel-telemetry")
+	if !ok {
+		t.Fatal("expected telemetry to remain queryable after cancel")
+	}
+	if tm.LastState != RunStateCanceled {
+		t.Fatalf("last state=%s want=%s", tm.LastState, RunStateCanceled)
 	}
 }

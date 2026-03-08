@@ -2121,7 +2121,7 @@ func TestRunFrontierPauseResumeGatesSchedulerDispatch(t *testing.T) {
 	deadline = time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
 		telemetry, ok = GetRunTelemetry(runID)
-		if ok && telemetry.ResumeCount >= 1 && telemetry.LastState == "running" && !telemetry.CurrentlyPaused {
+		if ok && telemetry.ResumeCount >= 1 && telemetry.LastState == RunStateRunning && !telemetry.CurrentlyPaused {
 			break
 		}
 		time.Sleep(1 * time.Millisecond)
@@ -2132,7 +2132,7 @@ func TestRunFrontierPauseResumeGatesSchedulerDispatch(t *testing.T) {
 	if telemetry.ResumeCount < 1 {
 		t.Fatalf("expected resume count to increment, got %d", telemetry.ResumeCount)
 	}
-	if telemetry.LastState != "running" {
+	if telemetry.LastState != RunStateRunning {
 		t.Fatalf("expected running state after resume, got %s", telemetry.LastState)
 	}
 	if telemetry.CurrentlyPaused {
