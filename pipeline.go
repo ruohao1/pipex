@@ -283,150 +283,116 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 						}
 
 						stageDef := stages[stage]
-
-						if limiter, ok := limiters[stage]; ok {
-							if err := limiter.Wait(runCtx); err != nil {
-								return fmt.Errorf("stage %s: rate limit wait: %w", stage, err)
-							}
-						}
-
 						policy, hasPolicy := runOpts.StagePolicies[stage]
 						if !hasPolicy {
 							policy = StagePolicy{MaxAttempts: 1}
 						}
-						if policy.MaxAttempts <= 0 {
-							policy.MaxAttempts = 1
-						}
 
-						stageStart := time.Now()
-						iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
-							RunID:     runID,
-							Stage:     stage,
-							Input:     in,
-							StartedAt: stageStart,
-						})
-
-						var (
-							out []T
-							err error
-						)
-
-						for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
-							attemptCtx := runCtx
-							var cancel context.CancelFunc = func() {}
-							if policy.Timeout > 0 {
-								attemptCtx, cancel = context.WithTimeout(runCtx, policy.Timeout)
-							}
-
-							attemptStart := time.Now()
-							iruntime.Call2(runOpts.Hooks.StageAttemptStart, runCtx, StageAttemptStartEvent[T]{
-								RunID:     runID,
-								Stage:     stage,
-								Input:     in,
-								Attempt:   attempt,
-								StartedAt: attemptStart,
-							})
-							out, err = stageDef.Process(attemptCtx, in)
-							attemptFinish := time.Now()
-							attemptDuration := attemptFinish.Sub(attemptStart)
-							cancel()
-
-							if err == nil {
+						execResult := iruntime.ExecuteStageWithPolicy(iruntime.StageExecutionConfig[T]{
+							Ctx:    runCtx,
+							Stage:  stage,
+							Input:  in,
+							Policy: iruntime.StageExecutionPolicy{MaxAttempts: policy.MaxAttempts, Backoff: policy.Backoff, Timeout: policy.Timeout},
+							Process: func(attemptCtx context.Context, item T) ([]T, error) {
+								return stageDef.Process(attemptCtx, item)
+							},
+							IsContextErr: isContextErr,
+							WaitRate: func(waitCtx context.Context) error {
+								if limiter, ok := limiters[stage]; ok {
+									if err := limiter.Wait(waitCtx); err != nil {
+										return fmt.Errorf("rate limit wait: %w", err)
+									}
+								}
+								return nil
+							},
+							OnStageStart: func(startedAt time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
+									RunID:     runID,
+									Stage:     stage,
+									Input:     in,
+									StartedAt: startedAt,
+								})
+							},
+							OnStageFinish: func(outCount int, startedAt, finishedAt time.Time) {
 								iruntime.Call2(runOpts.Hooks.StageFinish, runCtx, StageFinishEvent[T]{
 									RunID:      runID,
 									Stage:      stage,
 									Input:      in,
-									OutCount:   len(out),
-									StartedAt:  stageStart,
-									FinishedAt: attemptFinish,
-									Duration:   attemptFinish.Sub(stageStart),
+									OutCount:   outCount,
+									StartedAt:  startedAt,
+									FinishedAt: finishedAt,
+									Duration:   finishedAt.Sub(startedAt),
 								})
-								break
-							}
-
-							iruntime.Call2(runOpts.Hooks.StageAttemptError, runCtx, StageAttemptErrorEvent[T]{
-								RunID:      runID,
-								Stage:      stage,
-								Input:      in,
-								Attempt:    attempt,
-								StartedAt:  attemptStart,
-								FinishedAt: attemptFinish,
-								Duration:   attemptDuration,
-								Err:        err,
-							})
-							if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+							},
+							OnStageError: func(startedAt, finishedAt time.Time, err error) {
+								iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
+									RunID:      runID,
+									Stage:      stage,
+									Input:      in,
+									StartedAt:  startedAt,
+									FinishedAt: finishedAt,
+									Duration:   finishedAt.Sub(startedAt),
+									Err:        err,
+								})
+							},
+							OnAttemptStart: func(attempt int, startedAt time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageAttemptStart, runCtx, StageAttemptStartEvent[T]{
+									RunID:     runID,
+									Stage:     stage,
+									Input:     in,
+									Attempt:   attempt,
+									StartedAt: startedAt,
+								})
+							},
+							OnAttemptError: func(attempt int, startedAt, finishedAt time.Time, err error) {
+								iruntime.Call2(runOpts.Hooks.StageAttemptError, runCtx, StageAttemptErrorEvent[T]{
+									RunID:      runID,
+									Stage:      stage,
+									Input:      in,
+									Attempt:    attempt,
+									StartedAt:  startedAt,
+									FinishedAt: finishedAt,
+									Duration:   finishedAt.Sub(startedAt),
+									Err:        err,
+								})
+							},
+							OnRetry: func(attempt int, err error, backoff time.Duration, at time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageRetry, runCtx, StageRetryEvent[T]{
+									RunID:   runID,
+									Stage:   stage,
+									Input:   in,
+									Attempt: attempt,
+									Err:     err,
+									Backoff: backoff,
+									At:      at,
+								})
+							},
+							OnTimeout: func(attempt int, startedAt time.Time, timeout time.Duration, at time.Time) {
 								iruntime.Call2(runOpts.Hooks.StageTimeout, runCtx, StageTimeoutEvent[T]{
 									RunID:     runID,
 									Stage:     stage,
 									Input:     in,
 									Attempt:   attempt,
-									StartedAt: attemptStart,
-									Timeout:   policy.Timeout,
-									At:        attemptFinish,
+									StartedAt: startedAt,
+									Timeout:   timeout,
+									At:        at,
 								})
-							}
-
-							// stop immediately on run cancellation
-							if runCtx.Err() != nil {
-								if !isContextErr(err) {
-									iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
-										RunID:      runID,
-										Stage:      stage,
-										Input:      in,
-										StartedAt:  stageStart,
-										FinishedAt: attemptFinish,
-										Duration:   attemptFinish.Sub(stageStart),
-										Err:        err,
-									})
-									return fmt.Errorf("stage %s: %w", stage, err)
-								}
-								return runCtx.Err()
-							}
-
-							// no retries left
-							if attempt == policy.MaxAttempts {
+							},
+							OnExhausted: func(attempt int, err error, at time.Time) {
 								iruntime.Call2(runOpts.Hooks.StageExhausted, runCtx, StageExhaustedEvent[T]{
 									RunID:    runID,
 									Stage:    stage,
 									Input:    in,
 									Attempts: attempt,
 									Err:      err,
-									At:       attemptFinish,
+									At:       at,
 								})
-								iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
-									RunID:      runID,
-									Stage:      stage,
-									Input:      in,
-									StartedAt:  stageStart,
-									FinishedAt: attemptFinish,
-									Duration:   attemptFinish.Sub(stageStart),
-									Err:        err,
-								})
-								break
-							}
+							},
+						})
 
-							iruntime.Call2(runOpts.Hooks.StageRetry, runCtx, StageRetryEvent[T]{
-								RunID:   runID,
-								Stage:   stage,
-								Input:   in,
-								Attempt: attempt,
-								Err:     err,
-								Backoff: policy.Backoff,
-								At:      attemptFinish,
-							})
-
-							// context-aware backoff
-							if policy.Backoff > 0 {
-								select {
-								case <-runCtx.Done():
-									return runCtx.Err()
-								case <-time.After(policy.Backoff):
-								}
-							}
-						}
-
-						if err != nil {
-							if frontierEntryID != 0 {
+						if execResult.Err != nil {
+							err := execResult.Err
+							if execResult.AckOnError && frontierEntryID != 0 {
 								ackErr := fs.Ack(frontierEntryID)
 								if ackErr != nil {
 									return fmt.Errorf("stage %s: %w", stage, errors.Join(err, fmt.Errorf("frontier ack after stage error: %w", ackErr)))
@@ -441,8 +407,12 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 									At:      time.Now(),
 								})
 							}
+							if isContextErr(err) {
+								return err
+							}
 							return fmt.Errorf("stage %s: %w", stage, err)
 						}
+						out := execResult.Out
 
 						resultsMu.Lock()
 						results[stage] = append(results[stage], out...)
