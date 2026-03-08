@@ -3,6 +3,8 @@ package pipex
 import (
 	"maps"
 	"time"
+
+	"github.com/ruohao1/pipex/internal/frontier"
 )
 
 type RunOptions[T any] struct {
@@ -12,16 +14,18 @@ type RunOptions[T any] struct {
 	FrontierPendingCap      int
 	FrontierBlockingEnqueue bool
 	FrontierStatsInterval   time.Duration
-	Triggers                []Trigger[T]
-	Sinks                   []Sink[T]
-	Hooks                   Hooks[T]
-	CycleMode               CycleModeOptions[T]
-	SinkRetry               SinkRetryPolicy
-	ReturnPartialResults    bool
-	StageWorkers            map[string]int
-	StageRateLimits         map[string]RateLimit
-	StagePolicies           map[string]StagePolicy
-	DedupRules              []DedupRule[T]
+	FrontierStore           frontier.Store[T]
+
+	Triggers             []Trigger[T]
+	Sinks                []Sink[T]
+	Hooks                Hooks[T]
+	CycleMode            CycleModeOptions[T]
+	SinkRetry            SinkRetryPolicy
+	ReturnPartialResults bool
+	StageWorkers         map[string]int
+	StageRateLimits      map[string]RateLimit
+	StagePolicies        map[string]StagePolicy
+	DedupRules           []DedupRule[T]
 }
 
 type CycleModeOptions[T any] struct {
@@ -141,6 +145,12 @@ func WithFrontierStatsInterval[T any](interval time.Duration) Option[T] {
 			return
 		}
 		opts.FrontierStatsInterval = interval
+	}
+}
+
+func WithFrontierStore[T any](store frontier.Store[T]) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.FrontierStore = store
 	}
 }
 

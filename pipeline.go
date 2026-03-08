@@ -271,15 +271,33 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	useFrontier := runOpts.UseFrontier
 	var fs frontier.Store[T]
 	if useFrontier {
-		frontierCap := runOpts.FrontierPendingCap
-		if frontierCap <= 0 {
-			frontierCap = runOpts.BufferSize * len(stages)
-			if frontierCap < 1024 {
-				frontierCap = 1024
+		if runOpts.FrontierStore != nil {
+			fs = runOpts.FrontierStore
+		} else {
+			frontierCap := runOpts.FrontierPendingCap
+			if frontierCap <= 0 {
+				frontierCap = max(1024, runOpts.BufferSize*len(stages))
+			}
+			fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
+		defer func() { _ = fs.Close() }()
+		}
+
+		if dfs, ok := fs.(frontier.DurableFrontierStore[T]); ok {
+			const requeueLimit = 4096 // or run option
+			if n, err := dfs.RequeueExpired(runCtx, time.Now(), requeueLimit); err != nil {
+				recordErr(fmt.Errorf("frontier requeue expired: %w", err))
+				if runOpts.FailFast {
+					retErr = err
+					return nil, err
+				}
+			} else if n > 0 {
+				iruntime.Call2(runOpts.Hooks.FrontierRequeueExpired, runCtx, FrontierRequeueExpiredEvent{
+					RunID: runID,
+					Count: n,
+					At:    time.Now(),
+				})
 			}
 		}
-		fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
-		defer func() { _ = fs.Close() }()
 
 		if runOpts.FrontierStatsInterval > 0 {
 			if statsProvider, ok := fs.(frontier.StatsProvider); ok {

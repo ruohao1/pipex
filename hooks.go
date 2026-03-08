@@ -46,11 +46,12 @@ type Hooks[T any] struct {
 
 	DedupDrop func(ctx context.Context, e DedupDropEvent[T])
 
-	FrontierEnqueue func(ctx context.Context, e FrontierEnqueueEvent[T])
-	FrontierReserve func(ctx context.Context, e FrontierReserveEvent[T])
-	FrontierAck     func(ctx context.Context, e FrontierAckEvent[T])
-	FrontierRetry   func(ctx context.Context, e FrontierRetryEvent[T])
-	FrontierStats   func(ctx context.Context, e FrontierStatsEvent)
+	FrontierEnqueue        func(ctx context.Context, e FrontierEnqueueEvent[T])
+	FrontierReserve        func(ctx context.Context, e FrontierReserveEvent[T])
+	FrontierAck            func(ctx context.Context, e FrontierAckEvent[T])
+	FrontierRetry          func(ctx context.Context, e FrontierRetryEvent[T])
+	FrontierStats          func(ctx context.Context, e FrontierStatsEvent)
+	FrontierRequeueExpired func(ctx context.Context, e FrontierRequeueExpiredEvent)
 }
 
 // Stage events
@@ -282,4 +283,11 @@ type FrontierStatsEvent struct {
 	EnqueueFull       int64
 	PendingQueueDepth int
 	At                time.Time
+}
+
+type FrontierRequeueExpiredEvent struct {
+	RunID   string
+	EntryID uint64
+	Count   int
+	At      time.Time
 }

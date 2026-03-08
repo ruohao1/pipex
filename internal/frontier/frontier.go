@@ -3,6 +3,7 @@ package frontier
 import "context"
 
 type Entry[T any] struct {
+	Key		 string
 	ID      uint64
 	Stage   string
 	Input   T
