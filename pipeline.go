@@ -597,13 +597,6 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		if !useFrontier {
 			return
 		}
-		batchSize := min(64, max(1, runOpts.BufferSize))
-		batchBuf := make([]frontier.Entry[T], 0, batchSize)
-		type frontierBatchReserver interface {
-			ReserveInto(ctx context.Context, dst []frontier.Entry[T], max int) ([]frontier.Entry[T], bool, error)
-		}
-		batchReserver, hasBatchReserver := fs.(frontierBatchReserver)
-
 		dispatchReserved := func(entry frontier.Entry[T]) {
 			iruntime.Call2(runOpts.Hooks.FrontierReserve, runCtx, FrontierReserveEvent[T]{
 				RunID:   runID,
@@ -657,39 +650,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			}
 		}
 
-		for {
-			if hasBatchReserver {
-				batchBuf = batchBuf[:0]
-				entries, ok, err := batchReserver.ReserveInto(runCtx, batchBuf, batchSize)
-				if err != nil {
-					if isContextErr(err) {
-						return
-					}
-					recordErr(fmt.Errorf("frontier reserve batch: %w", err))
-					continue
-				}
-				if !ok {
-					return
-				}
-				for _, entry := range entries {
-					dispatchReserved(entry)
-				}
-				continue
-			}
-
-			entry, ok, err := fs.Reserve(runCtx)
-			if err != nil {
-				if isContextErr(err) {
-					return
-				}
-				recordErr(fmt.Errorf("frontier reserve: %w", err))
-				continue
-			}
-			if !ok {
-				return
-			}
-			dispatchReserved(entry)
-		}
+		iruntime.RunFrontierScheduler(iruntime.FrontierSchedulerConfig[T]{
+			Ctx:          runCtx,
+			BufferSize:   runOpts.BufferSize,
+			Store:        fs,
+			IsContextErr: isContextErr,
+			Dispatch:     dispatchReserved,
+			OnError:      recordErr,
+		})
 	})
 
 	enqueueSeeds(seeds, enqueueGuarded, recordErr)
