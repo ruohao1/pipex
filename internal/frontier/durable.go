@@ -11,6 +11,16 @@ type Lease struct {
 	Until time.Time
 }
 
+const (
+	// DefaultDurableLeaseTTL is the default reservation lease window used by
+	// durable frontier implementations when no explicit policy override exists.
+	DefaultDurableLeaseTTL = 30 * time.Second
+
+	// DefaultRequeueExpiredLimit bounds how many expired reservations are
+	// requeued in one recovery pass.
+	DefaultRequeueExpiredLimit = 4096
+)
+
 type DurableFrontierStore[T any] interface {
 	Enqueue(ctx context.Context, e Entry[T]) (created bool, err error) // idempotent by Key
 	Reserve(ctx context.Context, max int, leaseTTL time.Duration) ([]Entry[T], []Lease, error)

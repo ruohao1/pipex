@@ -1027,8 +1027,7 @@ func setupFrontierRuntime[T any](
 	}
 
 	if dfs, ok := fs.(frontier.DurableFrontierStore[T]); ok {
-		const requeueLimit = 4096 // or run option
-		if n, err := dfs.RequeueExpired(runCtx, time.Now(), requeueLimit); err != nil {
+		if n, err := dfs.RequeueExpired(runCtx, time.Now(), frontier.DefaultRequeueExpiredLimit); err != nil {
 			recordErr(fmt.Errorf("frontier requeue expired: %w", err))
 			if runOpts.FailFast {
 				return nil, closeOnExit, err
