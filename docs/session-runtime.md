@@ -87,3 +87,41 @@ These can remain internal until semantics stabilize.
 - Define durable lease-expiry requeue policy constants and tests.
 - Add internal run status snapshot aggregation for durable frontier stores.
 - Validate resume idempotency under repeated calls and partial failures.
+
+## Public Test-Facing Telemetry
+
+`pipex` now exposes run lifecycle telemetry lookups on the public package so
+external integration tests (for example, `penta`) can assert pause/resume
+behavior by `run_id` without importing internal packages.
+
+### Capture `run_id` from hooks
+
+```go
+var runID string
+
+_, _ = p.Run(ctx, seeds, pipex.WithHooks(pipex.Hooks[Item]{
+	RunStart: func(_ context.Context, meta pipex.RunMeta) {
+		runID = meta.RunID
+	},
+}))
+```
+
+### Query per-run telemetry
+
+```go
+tm, ok := pipex.GetRunTelemetry(runID)
+if !ok {
+	t.Fatalf("missing run telemetry for run_id=%s", runID)
+}
+
+if tm.PauseCount != 1 || tm.ResumeCount != 1 {
+	t.Fatalf("unexpected pause/resume counts: %+v", tm)
+}
+```
+
+### Query all tracked runs
+
+```go
+active := pipex.GetRunTelemetrySnapshot(true) // excludes canceled/completed
+all := pipex.GetRunTelemetrySnapshot(false)   // includes terminal runs
+```
