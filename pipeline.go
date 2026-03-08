@@ -256,237 +256,205 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	startStagePools(runCtx, stages, runOpts, poolsByStage, jobsByStage, &poolErrWG, recordErr)
 
 	enqueueDirect = func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error {
-		stageJobs, ok := jobsByStage[stageName]
-		if !ok {
-			return StageNotFound(stageName)
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		tasksWG.Add(1)
-		job := Job{
-			Name: stageName, // Kill per-job fmt.Sprintf in hot path
-			Run: func(_ context.Context) error {
-				defer tasksWG.Done()
-				if frontierEntryID != 0 {
-					defer frontierOutstandingWG.Done()
-				}
-				if runCtx.Err() != nil {
-					return runCtx.Err()
-				}
-
-				stage := stages[stageName]
-
-				if limiter, ok := limiters[stageName]; ok {
-					if err := limiter.Wait(runCtx); err != nil {
-						return fmt.Errorf("stage %s: rate limit wait: %w", stageName, err)
-					}
-				}
-
-				policy, hasPolicy := runOpts.StagePolicies[stageName]
-				if !hasPolicy {
-					policy = StagePolicy{MaxAttempts: 1}
-				}
-				if policy.MaxAttempts <= 0 {
-					policy.MaxAttempts = 1
-				}
-
-				stageStart := time.Now()
-				iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
-					RunID:     runID,
-					Stage:     stageName,
-					Input:     in,
-					StartedAt: stageStart,
-				})
-
-				var (
-					out []T
-					err error
-				)
-
-				for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
-					attemptCtx := runCtx
-					var cancel context.CancelFunc = func() {}
-					if policy.Timeout > 0 {
-						attemptCtx, cancel = context.WithTimeout(runCtx, policy.Timeout)
-					}
-
-					attemptStart := time.Now()
-					iruntime.Call2(runOpts.Hooks.StageAttemptStart, runCtx, StageAttemptStartEvent[T]{
-						RunID:     runID,
-						Stage:     stageName,
-						Input:     in,
-						Attempt:   attempt,
-						StartedAt: attemptStart,
-					})
-					out, err = stage.Process(attemptCtx, in)
-					attemptFinish := time.Now()
-					attemptDuration := attemptFinish.Sub(attemptStart)
-					cancel()
-
-					if err == nil {
-						iruntime.Call2(runOpts.Hooks.StageFinish, runCtx, StageFinishEvent[T]{
-							RunID:      runID,
-							Stage:      stageName,
-							Input:      in,
-							OutCount:   len(out),
-							StartedAt:  stageStart,
-							FinishedAt: attemptFinish,
-							Duration:   attemptFinish.Sub(stageStart),
-						})
-						break
-					}
-
-					iruntime.Call2(runOpts.Hooks.StageAttemptError, runCtx, StageAttemptErrorEvent[T]{
-						RunID:      runID,
-						Stage:      stageName,
-						Input:      in,
-						Attempt:    attempt,
-						StartedAt:  attemptStart,
-						FinishedAt: attemptFinish,
-						Duration:   attemptDuration,
-						Err:        err,
-					})
-					if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
-						iruntime.Call2(runOpts.Hooks.StageTimeout, runCtx, StageTimeoutEvent[T]{
-							RunID:     runID,
-							Stage:     stageName,
-							Input:     in,
-							Attempt:   attempt,
-							StartedAt: attemptStart,
-							Timeout:   policy.Timeout,
-							At:        attemptFinish,
-						})
-					}
-
-					// stop immediately on run cancellation
-					if runCtx.Err() != nil {
-						if !isContextErr(err) {
-							iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
-								RunID:      runID,
-								Stage:      stageName,
-								Input:      in,
-								StartedAt:  stageStart,
-								FinishedAt: attemptFinish,
-								Duration:   attemptFinish.Sub(stageStart),
-								Err:        err,
-							})
-							return fmt.Errorf("stage %s: %w", stageName, err)
-						}
-						return runCtx.Err()
-					}
-
-					// no retries left
-					if attempt == policy.MaxAttempts {
-						iruntime.Call2(runOpts.Hooks.StageExhausted, runCtx, StageExhaustedEvent[T]{
-							RunID:    runID,
-							Stage:    stageName,
-							Input:    in,
-							Attempts: attempt,
-							Err:      err,
-							At:       attemptFinish,
-						})
-						iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
-							RunID:      runID,
-							Stage:      stageName,
-							Input:      in,
-							StartedAt:  stageStart,
-							FinishedAt: attemptFinish,
-							Duration:   attemptFinish.Sub(stageStart),
-							Err:        err,
-						})
-						break
-					}
-
-					iruntime.Call2(runOpts.Hooks.StageRetry, runCtx, StageRetryEvent[T]{
-						RunID:   runID,
-						Stage:   stageName,
-						Input:   in,
-						Attempt: attempt,
-						Err:     err,
-						Backoff: policy.Backoff,
-						At:      attemptFinish,
-					})
-
-					// context-aware backoff
-					if policy.Backoff > 0 {
-						select {
-						case <-runCtx.Done():
-							return runCtx.Err()
-						case <-time.After(policy.Backoff):
-						}
-					}
-				}
-
-				if err != nil {
-					if frontierEntryID != 0 {
-						ackErr := fs.Ack(frontierEntryID)
-						if ackErr != nil {
-							return fmt.Errorf("stage %s: %w", stageName, errors.Join(err, fmt.Errorf("frontier ack after stage error: %w", ackErr)))
-						}
-						iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
-							RunID:   runID,
-							EntryID: frontierEntryID,
-							Stage:   stageName,
-							Input:   in,
-							Hops:    hops,
-							Attempt: frontierEntryAttempt,
-							At:      time.Now(),
-						})
-					}
-					return fmt.Errorf("stage %s: %w", stageName, err)
-				}
-
-				resultsMu.Lock()
-				results[stageName] = append(results[stageName], out...)
-				resultsMu.Unlock()
-
-				for _, item := range out {
-					for _, sinkCh := range sinksByStage[stageName] {
-						select {
-						case <-runCtx.Done():
-							return runCtx.Err()
-						case sinkCh <- item:
-						}
-					}
-				}
-
-				for _, nextStage := range edges[stageName] {
-					for _, item := range out {
-						if err := enqueueGuarded(nextStage, item, hops+1); err != nil {
-							return fmt.Errorf("enqueue to %s: %w", nextStage, err)
-						}
-					}
-				}
-
-				if frontierEntryID != 0 {
-					if err := fs.Ack(frontierEntryID); err != nil {
-						return fmt.Errorf("frontier ack: %w", err)
-					}
-					iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
-						RunID:   runID,
-						EntryID: frontierEntryID,
-						Stage:   stageName,
-						Input:   in,
-						Hops:    hops,
-						Attempt: frontierEntryAttempt,
-						At:      time.Now(),
-					})
-				}
-				return nil
+		return iruntime.EnqueueDirect(iruntime.DirectEnqueueConfig[Job]{
+			Ctx:       ctx,
+			StageName: stageName,
+			LookupQueue: func(stage string) (chan Job, bool) {
+				q, ok := jobsByStage[stage]
+				return q, ok
 			},
-		}
+			BuildStageNotFound: StageNotFound,
+			BeforeSchedule: func() {
+				tasksWG.Add(1)
+			},
+			OnCanceledAfterBuild: func() {
+				tasksWG.Done()
+			},
+			BuildJob: func(stage string) Job {
+				return Job{
+					Name: stage, // Kill per-job fmt.Sprintf in hot path
+					Run: func(_ context.Context) error {
+						defer tasksWG.Done()
+						if frontierEntryID != 0 {
+							defer frontierOutstandingWG.Done()
+						}
+						if runCtx.Err() != nil {
+							return runCtx.Err()
+						}
 
-		select {
-		case <-ctx.Done():
-			tasksWG.Done()
-			return ctx.Err()
+						stageDef := stages[stage]
+						policy, hasPolicy := runOpts.StagePolicies[stage]
+						if !hasPolicy {
+							policy = StagePolicy{MaxAttempts: 1}
+						}
 
-		case stageJobs <- job:
-			return nil
-		}
+						execResult := iruntime.ExecuteStageWithPolicy(iruntime.StageExecutionConfig[T]{
+							Ctx:    runCtx,
+							Stage:  stage,
+							Input:  in,
+							Policy: iruntime.StageExecutionPolicy{MaxAttempts: policy.MaxAttempts, Backoff: policy.Backoff, Timeout: policy.Timeout},
+							Process: func(attemptCtx context.Context, item T) ([]T, error) {
+								return stageDef.Process(attemptCtx, item)
+							},
+							IsContextErr: isContextErr,
+							WaitRate: func(waitCtx context.Context) error {
+								if limiter, ok := limiters[stage]; ok {
+									if err := limiter.Wait(waitCtx); err != nil {
+										return fmt.Errorf("rate limit wait: %w", err)
+									}
+								}
+								return nil
+							},
+							OnStageStart: func(startedAt time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageStart, runCtx, StageStartEvent[T]{
+									RunID:     runID,
+									Stage:     stage,
+									Input:     in,
+									StartedAt: startedAt,
+								})
+							},
+							OnStageFinish: func(outCount int, startedAt, finishedAt time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageFinish, runCtx, StageFinishEvent[T]{
+									RunID:      runID,
+									Stage:      stage,
+									Input:      in,
+									OutCount:   outCount,
+									StartedAt:  startedAt,
+									FinishedAt: finishedAt,
+									Duration:   finishedAt.Sub(startedAt),
+								})
+							},
+							OnStageError: func(startedAt, finishedAt time.Time, err error) {
+								iruntime.Call2(runOpts.Hooks.StageError, runCtx, StageErrorEvent[T]{
+									RunID:      runID,
+									Stage:      stage,
+									Input:      in,
+									StartedAt:  startedAt,
+									FinishedAt: finishedAt,
+									Duration:   finishedAt.Sub(startedAt),
+									Err:        err,
+								})
+							},
+							OnAttemptStart: func(attempt int, startedAt time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageAttemptStart, runCtx, StageAttemptStartEvent[T]{
+									RunID:     runID,
+									Stage:     stage,
+									Input:     in,
+									Attempt:   attempt,
+									StartedAt: startedAt,
+								})
+							},
+							OnAttemptError: func(attempt int, startedAt, finishedAt time.Time, err error) {
+								iruntime.Call2(runOpts.Hooks.StageAttemptError, runCtx, StageAttemptErrorEvent[T]{
+									RunID:      runID,
+									Stage:      stage,
+									Input:      in,
+									Attempt:    attempt,
+									StartedAt:  startedAt,
+									FinishedAt: finishedAt,
+									Duration:   finishedAt.Sub(startedAt),
+									Err:        err,
+								})
+							},
+							OnRetry: func(attempt int, err error, backoff time.Duration, at time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageRetry, runCtx, StageRetryEvent[T]{
+									RunID:   runID,
+									Stage:   stage,
+									Input:   in,
+									Attempt: attempt,
+									Err:     err,
+									Backoff: backoff,
+									At:      at,
+								})
+							},
+							OnTimeout: func(attempt int, startedAt time.Time, timeout time.Duration, at time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageTimeout, runCtx, StageTimeoutEvent[T]{
+									RunID:     runID,
+									Stage:     stage,
+									Input:     in,
+									Attempt:   attempt,
+									StartedAt: startedAt,
+									Timeout:   timeout,
+									At:        at,
+								})
+							},
+							OnExhausted: func(attempt int, err error, at time.Time) {
+								iruntime.Call2(runOpts.Hooks.StageExhausted, runCtx, StageExhaustedEvent[T]{
+									RunID:    runID,
+									Stage:    stage,
+									Input:    in,
+									Attempts: attempt,
+									Err:      err,
+									At:       at,
+								})
+							},
+						})
 
+						if execResult.Err != nil {
+							err := execResult.Err
+							if execResult.AckOnError && frontierEntryID != 0 {
+								ackErr := fs.Ack(frontierEntryID)
+								if ackErr != nil {
+									return fmt.Errorf("stage %s: %w", stage, errors.Join(err, fmt.Errorf("frontier ack after stage error: %w", ackErr)))
+								}
+								iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
+									RunID:   runID,
+									EntryID: frontierEntryID,
+									Stage:   stage,
+									Input:   in,
+									Hops:    hops,
+									Attempt: frontierEntryAttempt,
+									At:      time.Now(),
+								})
+							}
+							if isContextErr(err) {
+								return err
+							}
+							return fmt.Errorf("stage %s: %w", stage, err)
+						}
+						out := execResult.Out
+
+						resultsMu.Lock()
+						results[stage] = append(results[stage], out...)
+						resultsMu.Unlock()
+
+						for _, item := range out {
+							for _, sinkCh := range sinksByStage[stage] {
+								select {
+								case <-runCtx.Done():
+									return runCtx.Err()
+								case sinkCh <- item:
+								}
+							}
+						}
+
+						for _, nextStage := range edges[stage] {
+							for _, item := range out {
+								if err := enqueueGuarded(nextStage, item, hops+1); err != nil {
+									return fmt.Errorf("enqueue to %s: %w", nextStage, err)
+								}
+							}
+						}
+
+						if frontierEntryID != 0 {
+							if err := fs.Ack(frontierEntryID); err != nil {
+								return fmt.Errorf("frontier ack: %w", err)
+							}
+							iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
+								RunID:   runID,
+								EntryID: frontierEntryID,
+								Stage:   stage,
+								Input:   in,
+								Hops:    hops,
+								Attempt: frontierEntryAttempt,
+								At:      time.Now(),
+							})
+						}
+						return nil
+					},
+				}
+			},
+		})
 	}
 
 	var schedulerWG sync.WaitGroup
