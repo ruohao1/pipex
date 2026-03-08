@@ -40,6 +40,12 @@ func NewRunHandle(runID string, cancel context.CancelFunc) *RunHandle {
 	}
 }
 
+func (h *RunHandle) SetCancel(cancel context.CancelFunc) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cancel = cancel
+}
+
 // Pause transitions running -> paused. Returns true when state changed.
 func (h *RunHandle) Pause() bool {
 	h.mu.Lock()

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ruohao1/pipex/internal/frontier"
+	iruntime "github.com/ruohao1/pipex/internal/runtime"
 )
 
 type testStage[T any] struct {
@@ -2053,6 +2054,70 @@ func TestRunFrontierStatsHook_DurableProviderErrorRecorded(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "frontier durable status snapshot") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunFrontierPauseResumeGatesSchedulerDispatch(t *testing.T) {
+	p := NewPipeline[int]()
+	var processed atomic.Int64
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			processed.Add(1)
+			return []int{in}, nil
+		},
+	})
+
+	done := make(chan error, 1)
+	var rid atomic.Value
+	go func() {
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": {1, 2, 3, 4, 5}},
+			WithFrontier[int](true),
+			WithHooks[int](Hooks[int]{
+				RunStart: func(ctx context.Context, meta RunMeta) {
+					rid.Store(meta.RunID)
+					_ = iruntime.PauseRun(meta.RunID)
+				},
+			}),
+		)
+		done <- err
+	}()
+
+	deadline := time.Now().Add(1 * time.Second)
+	for rid.Load() == nil && time.Now().Before(deadline) {
+		time.Sleep(1 * time.Millisecond)
+	}
+	v := rid.Load()
+	if v == nil {
+		t.Fatal("run id not captured")
+	}
+	runID, _ := v.(string)
+	if runID == "" {
+		t.Fatal("empty run id")
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if got := processed.Load(); got != 0 {
+		t.Fatalf("expected no processing while paused, got %d", got)
+	}
+
+	if !iruntime.ResumeRun(runID) {
+		t.Fatal("expected resume to succeed")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not complete after resume")
+	}
+	if got := processed.Load(); got != 5 {
+		t.Fatalf("processed=%d want=5", got)
 	}
 }
 

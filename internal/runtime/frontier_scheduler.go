@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/ruohao1/pipex/internal/frontier"
 )
@@ -14,11 +15,18 @@ type FrontierSchedulerConfig[T any] struct {
 	IsContextErr func(error) bool
 	Dispatch     func(entry frontier.Entry[T])
 	OnError      func(error)
+	ShouldPause  func() bool
+	PausePoll    time.Duration
 }
 
 // RunFrontierScheduler reserves frontier entries and dispatches them until the
 // store closes, context ends, or a terminal reserve condition is reached.
 func RunFrontierScheduler[T any](cfg FrontierSchedulerConfig[T]) {
+	pausePoll := cfg.PausePoll
+	if pausePoll <= 0 {
+		pausePoll = 5 * time.Millisecond
+	}
+
 	batchSize := min(64, max(1, cfg.BufferSize))
 	batchBuf := make([]frontier.Entry[T], 0, batchSize)
 
@@ -28,6 +36,14 @@ func RunFrontierScheduler[T any](cfg FrontierSchedulerConfig[T]) {
 	batchReserver, hasBatchReserver := cfg.Store.(frontierBatchReserver)
 
 	for {
+		for cfg.ShouldPause != nil && cfg.ShouldPause() {
+			select {
+			case <-cfg.Ctx.Done():
+				return
+			case <-time.After(pausePoll):
+			}
+		}
+
 		if hasBatchReserver {
 			batchBuf = batchBuf[:0]
 			entries, ok, err := batchReserver.ReserveInto(cfg.Ctx, batchBuf, batchSize)

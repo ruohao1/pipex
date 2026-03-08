@@ -46,6 +46,9 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		opt(runOpts)
 	}
 	runID := iruntime.NewRunID()
+	runHandle := iruntime.NewRunHandle(runID, nil)
+	iruntime.RegisterRunHandle(runID, runHandle)
+	defer iruntime.UnregisterRunHandle(runID)
 
 	p.mu.RLock()
 	stages := make(map[string]Stage[T], len(p.stages))
@@ -128,7 +131,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	runCtx := ctx
-	runHandle := iruntime.NewRunHandle(runID, cancel)
+	runHandle.SetCancel(cancel)
 	defer func() {
 		if retErr == nil {
 			runHandle.MarkCompleted()
@@ -533,6 +536,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			IsContextErr: isContextErr,
 			Dispatch:     dispatchReserved,
 			OnError:      recordErr,
+			ShouldPause: func() bool {
+				return runHandle.Status().State == iruntime.RunStatePaused
+			},
+			PausePoll: 5 * time.Millisecond,
 		})
 	})
 
