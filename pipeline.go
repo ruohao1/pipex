@@ -122,10 +122,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		frontierStatsWG.Wait()
 	}()
 
-	limiters := map[string]*rate.Limiter{}
-	for stageName, cfg := range runOpts.StageRateLimits {
-		limiters[stageName] = rate.NewLimiter(rate.Limit(cfg.RPS), cfg.Burst)
-	}
+	limiters := buildStageLimiters(runOpts.StageRateLimits)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -401,135 +398,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		return nil
 	}
 
-	// Snapshot stage worker configuration and ensure all pools can be created
-	// before starting any worker goroutine. This avoids partial startup leaks
-	// if one stage has an invalid worker count at run time.
-	for stageName, stage := range stages {
-		pool, err := NewPool(PoolConfig{
-			Workers: func() int {
-				if count, ok := runOpts.StageWorkers[stageName]; ok {
-					return count
-				}
-				return stage.Workers()
-			}(),
-			Queue:         runOpts.BufferSize,
-			DrainOnCancel: true,
-		})
-		if err != nil {
-			retErr = fmt.Errorf("stage %s: failed to create worker pool: %w", stageName, err)
-			return nil, retErr
-		}
-		poolsByStage[stageName] = pool
+	poolsByStage, err = createPoolsByStage(stages, runOpts)
+	if err != nil {
+		retErr = err
+		return nil, retErr
 	}
 
-	for _, sink := range runOpts.Sinks {
-		sinkCh := make(chan T, runOpts.BufferSize)
-		sinksByStage[sink.Stage()] = append(sinksByStage[sink.Stage()], sinkCh)
-
-		sinksWG.Add(1)
-		go func(sink Sink[T], sinkCh chan T) {
-			defer sinksWG.Done()
-			disabled := false
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case item, ok := <-sinkCh:
-					if !ok {
-						return
-					}
-					if disabled {
-						continue
-					}
-
-					attempts := 0
-					for {
-						startTime := time.Now()
-						iruntime.Call2(runOpts.Hooks.SinkConsumeStart, runCtx, SinkConsumeStartEvent[T]{
-							RunID:     runID,
-							Sink:      sink.Name(),
-							Stage:     sink.Stage(),
-							Item:      item,
-							Attempt:   attempts + 1,
-							StartedAt: startTime,
-						})
-						err := sink.Consume(ctx, item)
-						finishTime := time.Now()
-						duration := finishTime.Sub(startTime)
-
-						if err == nil {
-							iruntime.Call2(runOpts.Hooks.SinkConsumeSuccess, runCtx, SinkConsumeSuccessEvent[T]{
-								RunID:      runID,
-								Sink:       sink.Name(),
-								Stage:      sink.Stage(),
-								Item:       item,
-								Attempt:    attempts + 1,
-								StartedAt:  startTime,
-								FinishedAt: finishTime,
-								Duration:   duration,
-							})
-							break
-						}
-						attempts++
-
-						if runOpts.SinkRetry.MaxRetries >= 0 && attempts > runOpts.SinkRetry.MaxRetries {
-							iruntime.Call2(runOpts.Hooks.SinkExhausted, runCtx, SinkExhaustedEvent[T]{
-								RunID:    runID,
-								Sink:     sink.Name(),
-								Stage:    sink.Stage(),
-								Item:     item,
-								Err:      err,
-								Attempts: attempts,
-								At:       time.Now(),
-							})
-							recordErr(fmt.Errorf("sink %s: retries exhausted: %w", sink.Name(), err))
-							disabled = true
-							break
-						}
-
-						if ctx.Err() != nil {
-							recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
-							return
-						}
-
-						iruntime.Call2(runOpts.Hooks.SinkRetry, runCtx, SinkRetryEvent[T]{
-							RunID:   runID,
-							Sink:    sink.Name(),
-							Stage:   sink.Stage(),
-							Item:    item,
-							Attempt: attempts,
-							Err:     err,
-							Backoff: runOpts.SinkRetry.Backoff,
-							At:      time.Now(),
-						})
-
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(runOpts.SinkRetry.Backoff):
-						}
-					}
-				}
-			}
-		}(sink, sinkCh)
-	}
-
-	for stageName := range stages {
-		stageJobs := make(chan Job, runOpts.BufferSize)
-		jobsByStage[stageName] = stageJobs
-
-		pool := poolsByStage[stageName]
-
-		poolErrWG.Add(1)
-		// Stage pools drain queued jobs after cancellation so tasksWG can reach zero.
-		poolErrCh := pool.Run(runCtx, stageJobs)
-		go func(poolErrCh <-chan error) {
-			defer poolErrWG.Done()
-			for err := range poolErrCh {
-				recordErr(err)
-			}
-		}(poolErrCh)
-	}
+	startSinkWorkers(ctx, runCtx, runID, runOpts, sinksByStage, &sinksWG, recordErr)
+	startStagePools(runCtx, stages, runOpts, poolsByStage, jobsByStage, &poolErrWG, recordErr)
 
 	enqueueDirect = func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error {
 		stageJobs, ok := jobsByStage[stageName]
@@ -1136,6 +1012,167 @@ func buildDedupRulesByStage[T any](rules []DedupRule[T], stages map[string]Stage
 	}
 
 	return byStage, nil
+}
+
+func buildStageLimiters(stageRateLimits map[string]RateLimit) map[string]*rate.Limiter {
+	limiters := map[string]*rate.Limiter{}
+	for stageName, cfg := range stageRateLimits {
+		limiters[stageName] = rate.NewLimiter(rate.Limit(cfg.RPS), cfg.Burst)
+	}
+	return limiters
+}
+
+func createPoolsByStage[T any](stages map[string]Stage[T], runOpts *RunOptions[T]) (map[string]*Pool, error) {
+	// Snapshot stage worker configuration and ensure all pools can be created
+	// before starting any worker goroutine. This avoids partial startup leaks
+	// if one stage has an invalid worker count at run time.
+	poolsByStage := make(map[string]*Pool, len(stages))
+	for stageName, stage := range stages {
+		pool, err := NewPool(PoolConfig{
+			Workers: func() int {
+				if count, ok := runOpts.StageWorkers[stageName]; ok {
+					return count
+				}
+				return stage.Workers()
+			}(),
+			Queue:         runOpts.BufferSize,
+			DrainOnCancel: true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: failed to create worker pool: %w", stageName, err)
+		}
+		poolsByStage[stageName] = pool
+	}
+	return poolsByStage, nil
+}
+
+func startSinkWorkers[T any](
+	ctx context.Context,
+	runCtx context.Context,
+	runID string,
+	runOpts *RunOptions[T],
+	sinksByStage map[string][]chan T,
+	sinksWG *sync.WaitGroup,
+	recordErr func(error),
+) {
+	for _, sink := range runOpts.Sinks {
+		sinkCh := make(chan T, runOpts.BufferSize)
+		sinksByStage[sink.Stage()] = append(sinksByStage[sink.Stage()], sinkCh)
+
+		sinksWG.Add(1)
+		go func(sink Sink[T], sinkCh chan T) {
+			defer sinksWG.Done()
+			disabled := false
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item, ok := <-sinkCh:
+					if !ok {
+						return
+					}
+					if disabled {
+						continue
+					}
+
+					attempts := 0
+					for {
+						startTime := time.Now()
+						iruntime.Call2(runOpts.Hooks.SinkConsumeStart, runCtx, SinkConsumeStartEvent[T]{
+							RunID:     runID,
+							Sink:      sink.Name(),
+							Stage:     sink.Stage(),
+							Item:      item,
+							Attempt:   attempts + 1,
+							StartedAt: startTime,
+						})
+						err := sink.Consume(ctx, item)
+						finishTime := time.Now()
+						duration := finishTime.Sub(startTime)
+
+						if err == nil {
+							iruntime.Call2(runOpts.Hooks.SinkConsumeSuccess, runCtx, SinkConsumeSuccessEvent[T]{
+								RunID:      runID,
+								Sink:       sink.Name(),
+								Stage:      sink.Stage(),
+								Item:       item,
+								Attempt:    attempts + 1,
+								StartedAt:  startTime,
+								FinishedAt: finishTime,
+								Duration:   duration,
+							})
+							break
+						}
+						attempts++
+
+						if runOpts.SinkRetry.MaxRetries >= 0 && attempts > runOpts.SinkRetry.MaxRetries {
+							iruntime.Call2(runOpts.Hooks.SinkExhausted, runCtx, SinkExhaustedEvent[T]{
+								RunID:    runID,
+								Sink:     sink.Name(),
+								Stage:    sink.Stage(),
+								Item:     item,
+								Err:      err,
+								Attempts: attempts,
+								At:       time.Now(),
+							})
+							recordErr(fmt.Errorf("sink %s: retries exhausted: %w", sink.Name(), err))
+							disabled = true
+							break
+						}
+
+						if ctx.Err() != nil {
+							recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
+							return
+						}
+
+						iruntime.Call2(runOpts.Hooks.SinkRetry, runCtx, SinkRetryEvent[T]{
+							RunID:   runID,
+							Sink:    sink.Name(),
+							Stage:   sink.Stage(),
+							Item:    item,
+							Attempt: attempts,
+							Err:     err,
+							Backoff: runOpts.SinkRetry.Backoff,
+							At:      time.Now(),
+						})
+
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(runOpts.SinkRetry.Backoff):
+						}
+					}
+				}
+			}
+		}(sink, sinkCh)
+	}
+}
+
+func startStagePools[T any](
+	runCtx context.Context,
+	stages map[string]Stage[T],
+	runOpts *RunOptions[T],
+	poolsByStage map[string]*Pool,
+	jobsByStage map[string]chan Job,
+	poolErrWG *sync.WaitGroup,
+	recordErr func(error),
+) {
+	for stageName := range stages {
+		stageJobs := make(chan Job, runOpts.BufferSize)
+		jobsByStage[stageName] = stageJobs
+
+		pool := poolsByStage[stageName]
+
+		poolErrWG.Add(1)
+		// Stage pools drain queued jobs after cancellation so tasksWG can reach zero.
+		poolErrCh := pool.Run(runCtx, stageJobs)
+		go func(poolErrCh <-chan error) {
+			defer poolErrWG.Done()
+			for err := range poolErrCh {
+				recordErr(err)
+			}
+		}(poolErrCh)
+	}
 }
 
 func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string, allowCycles bool) error {
