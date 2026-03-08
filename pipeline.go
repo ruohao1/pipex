@@ -128,6 +128,16 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	runCtx := ctx
+	runHandle := iruntime.NewRunHandle(runID, cancel)
+	defer func() {
+		if retErr == nil {
+			runHandle.MarkCompleted()
+			return
+		}
+		// For now, non-success run exits are represented as canceled in the
+		// internal handle model until a dedicated failed terminal state exists.
+		runHandle.Cancel()
+	}()
 
 	isContextErr := func(err error) bool {
 		return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
