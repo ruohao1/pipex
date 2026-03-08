@@ -85,88 +85,8 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		iruntime.Call3(runOpts.Hooks.RunEnd, ctx, runMeta, retErr)
 	}()
 
-	if runOpts.CycleMode.Enabled {
-		if runOpts.CycleMode.MaxHops < -1 {
-			retErr = ErrCycleModeInvalidMaxHops
-			return nil, retErr
-		}
-		if runOpts.CycleMode.MaxJobs <= 0 {
-			retErr = ErrCycleModeInvalidMaxJobs
-			return nil, retErr
-		}
-	}
-
-	if err := p.validateSnapshot(stages, edges, runOpts.CycleMode.Enabled); err != nil {
+	if err := p.validateRunPreflight(ctx, stages, edges, seeds, runOpts); err != nil {
 		retErr = err
-		return nil, retErr
-	}
-
-	for seedStage := range seeds {
-		if _, ok := stages[seedStage]; !ok {
-			retErr = StageNotFound(seedStage)
-			return nil, retErr
-		}
-	}
-	for _, trigger := range runOpts.Triggers {
-		if _, ok := stages[trigger.Stage()]; !ok {
-			retErr = fmt.Errorf("trigger %s: %w", trigger.Name(), StageNotFound(trigger.Stage()))
-			return nil, retErr
-		}
-	}
-	for _, sink := range runOpts.Sinks {
-		if _, ok := stages[sink.Stage()]; !ok {
-			retErr = fmt.Errorf("sink %s: %w", sink.Name(), StageNotFound(sink.Stage()))
-			return nil, retErr
-		}
-	}
-
-	for stageName, count := range runOpts.StageWorkers {
-		if _, ok := stages[stageName]; !ok {
-			retErr = fmt.Errorf("stage workers config: %w", StageNotFound(stageName))
-			return nil, retErr
-		}
-		if count <= 0 {
-			retErr = fmt.Errorf("stage %s: invalid worker count %d: %w", stageName, count, ErrInvalidWorkerCount)
-			return nil, retErr
-		}
-	}
-
-	for stageName, rate := range runOpts.StageRateLimits {
-		if _, ok := stages[stageName]; !ok {
-			retErr = fmt.Errorf("stage rate limits config: %w", StageNotFound(stageName))
-			return nil, retErr
-		}
-		if rate.RPS <= 0 {
-			retErr = fmt.Errorf("stage %s: invalid RPS %f: %w", stageName, rate.RPS, ErrInvalidRPS)
-			return nil, retErr
-		}
-		if rate.Burst < 1 {
-			retErr = fmt.Errorf("stage %s: invalid burst %d: %w", stageName, rate.Burst, ErrInvalidBurst)
-			return nil, retErr
-		}
-	}
-
-	for stageName, policy := range runOpts.StagePolicies {
-		if _, ok := stages[stageName]; !ok {
-			retErr = fmt.Errorf("stage policies config: %w", StageNotFound(stageName))
-			return nil, retErr
-		}
-		if policy.MaxAttempts < 1 {
-			retErr = fmt.Errorf("invalid stage policy max attempts %d: %w", policy.MaxAttempts, ErrInvalidStagePolicyMaxAttempts)
-			return nil, retErr
-		}
-		if policy.Backoff < 0 {
-			retErr = fmt.Errorf("invalid stage policy backoff %s: %w", policy.Backoff, ErrInvalidStagePolicyBackoff)
-			return nil, retErr
-		}
-		if policy.Timeout < 0 {
-			retErr = fmt.Errorf("invalid stage policy timeout %s: %w", policy.Timeout, ErrInvalidStagePolicyTimeout)
-			return nil, retErr
-		}
-	}
-
-	if ctx.Err() != nil {
-		retErr = ctx.Err()
 		return nil, retErr
 	}
 
@@ -181,40 +101,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	jobsByStage := make(map[string]chan Job, len(stages))
 	poolsByStage := make(map[string]*Pool, len(stages))
 	sinksByStage := make(map[string][]chan T)
-	dedupRulesByStage := make(map[string][]DedupRule[T])
-
-	for _, rule := range runOpts.DedupRules {
-		if rule.Name == "" {
-			retErr = ErrInvalidDedupRuleName
-			return nil, retErr
-		}
-		if rule.Key == nil {
-			retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleKey)
-			return nil, retErr
-		}
-		if rule.Scope == "" {
-			retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleScope)
-			return nil, retErr
-		}
-		stageScope, isStageScope := parseStageScope(rule.Scope)
-		if !isStageScope && rule.Scope != DedupScopeGlobal {
-			retErr = fmt.Errorf("dedup rule %s: invalid scope %s: %w", rule.Name, rule.Scope, ErrInvalidDedupRuleScope)
-			return nil, retErr
-		}
-
-		if isStageScope {
-			if _, ok := stages[stageScope]; !ok {
-				retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, StageNotFound(stageScope))
-				return nil, retErr
-			}
-			dedupRulesByStage[stageScope] = append(dedupRulesByStage[stageScope], rule)
-		}
-
-		if !isStageScope || rule.Scope == DedupScopeGlobal {
-			for stageName := range stages {
-				dedupRulesByStage[stageName] = append(dedupRulesByStage[stageName], rule)
-			}
-		}
+	dedupRulesByStage, err := buildDedupRulesByStage(runOpts.DedupRules, stages)
+	if err != nil {
+		retErr = err
+		return nil, retErr
 	}
 
 	var errsMu sync.Mutex
@@ -1130,6 +1020,122 @@ func (p *Pipeline[T]) Validate() error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.validateSnapshot(p.stages, p.edges, false)
+}
+
+func (p *Pipeline[T]) validateRunPreflight(
+	ctx context.Context,
+	stages map[string]Stage[T],
+	edges map[string][]string,
+	seeds map[string][]T,
+	runOpts *RunOptions[T],
+) error {
+	if runOpts.CycleMode.Enabled {
+		if runOpts.CycleMode.MaxHops < -1 {
+			return ErrCycleModeInvalidMaxHops
+		}
+		if runOpts.CycleMode.MaxJobs <= 0 {
+			return ErrCycleModeInvalidMaxJobs
+		}
+	}
+
+	if err := p.validateSnapshot(stages, edges, runOpts.CycleMode.Enabled); err != nil {
+		return err
+	}
+
+	for seedStage := range seeds {
+		if _, ok := stages[seedStage]; !ok {
+			return StageNotFound(seedStage)
+		}
+	}
+
+	for _, trigger := range runOpts.Triggers {
+		if _, ok := stages[trigger.Stage()]; !ok {
+			return fmt.Errorf("trigger %s: %w", trigger.Name(), StageNotFound(trigger.Stage()))
+		}
+	}
+
+	for _, sink := range runOpts.Sinks {
+		if _, ok := stages[sink.Stage()]; !ok {
+			return fmt.Errorf("sink %s: %w", sink.Name(), StageNotFound(sink.Stage()))
+		}
+	}
+
+	for stageName, count := range runOpts.StageWorkers {
+		if _, ok := stages[stageName]; !ok {
+			return fmt.Errorf("stage workers config: %w", StageNotFound(stageName))
+		}
+		if count <= 0 {
+			return fmt.Errorf("stage %s: invalid worker count %d: %w", stageName, count, ErrInvalidWorkerCount)
+		}
+	}
+
+	for stageName, rateCfg := range runOpts.StageRateLimits {
+		if _, ok := stages[stageName]; !ok {
+			return fmt.Errorf("stage rate limits config: %w", StageNotFound(stageName))
+		}
+		if rateCfg.RPS <= 0 {
+			return fmt.Errorf("stage %s: invalid RPS %f: %w", stageName, rateCfg.RPS, ErrInvalidRPS)
+		}
+		if rateCfg.Burst < 1 {
+			return fmt.Errorf("stage %s: invalid burst %d: %w", stageName, rateCfg.Burst, ErrInvalidBurst)
+		}
+	}
+
+	for stageName, policy := range runOpts.StagePolicies {
+		if _, ok := stages[stageName]; !ok {
+			return fmt.Errorf("stage policies config: %w", StageNotFound(stageName))
+		}
+		if policy.MaxAttempts < 1 {
+			return fmt.Errorf("invalid stage policy max attempts %d: %w", policy.MaxAttempts, ErrInvalidStagePolicyMaxAttempts)
+		}
+		if policy.Backoff < 0 {
+			return fmt.Errorf("invalid stage policy backoff %s: %w", policy.Backoff, ErrInvalidStagePolicyBackoff)
+		}
+		if policy.Timeout < 0 {
+			return fmt.Errorf("invalid stage policy timeout %s: %w", policy.Timeout, ErrInvalidStagePolicyTimeout)
+		}
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return nil
+}
+
+func buildDedupRulesByStage[T any](rules []DedupRule[T], stages map[string]Stage[T]) (map[string][]DedupRule[T], error) {
+	byStage := make(map[string][]DedupRule[T])
+
+	for _, rule := range rules {
+		if rule.Name == "" {
+			return nil, ErrInvalidDedupRuleName
+		}
+		if rule.Key == nil {
+			return nil, fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleKey)
+		}
+		if rule.Scope == "" {
+			return nil, fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleScope)
+		}
+		stageScope, isStageScope := parseStageScope(rule.Scope)
+		if !isStageScope && rule.Scope != DedupScopeGlobal {
+			return nil, fmt.Errorf("dedup rule %s: invalid scope %s: %w", rule.Name, rule.Scope, ErrInvalidDedupRuleScope)
+		}
+
+		if isStageScope {
+			if _, ok := stages[stageScope]; !ok {
+				return nil, fmt.Errorf("dedup rule %s: %w", rule.Name, StageNotFound(stageScope))
+			}
+			byStage[stageScope] = append(byStage[stageScope], rule)
+		}
+
+		if !isStageScope || rule.Scope == DedupScopeGlobal {
+			for stageName := range stages {
+				byStage[stageName] = append(byStage[stageName], rule)
+			}
+		}
+	}
+
+	return byStage, nil
 }
 
 func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string, allowCycles bool) error {
