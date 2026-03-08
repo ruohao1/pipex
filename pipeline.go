@@ -39,29 +39,6 @@ func parseStageScope(s DedupScope) (stage string, ok bool) {
 	return "", false
 }
 
-type frontierBlockingEnqueuer[T any] interface {
-	EnqueueWait(ctx context.Context, stage string, item T, hops int) (id uint64, err error)
-}
-
-type guardedEnqueueDeps[T any] struct {
-	ctx                  context.Context
-	runCtx               context.Context
-	runID                string
-	runOpts              *RunOptions[T]
-	dedupRulesByStage    map[string][]DedupRule[T]
-	seenMu               *sync.Mutex
-	seen                 map[string]struct{}
-	frontierMu           *sync.Mutex
-	acceptedJobs         *int
-	reservedJobs         *int
-	useFrontier          bool
-	frontierStore        frontier.Store[T]
-	blockingEnqueuer     frontierBlockingEnqueuer[T]
-	hasBlockingEnqueuer  bool
-	frontierOutstandingW *sync.WaitGroup
-	enqueueDirect        func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error
-}
-
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
 func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Option[T]) (map[string][]T, error) {
 	runOpts := defaultOptions[T]()
@@ -129,6 +106,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		retErr = err
 		return nil, retErr
 	}
+	runtimeDedupRulesByStage := toRuntimeDedupRulesByStage(dedupRulesByStage)
 
 	var errsMu sync.Mutex
 	var runErrs []error
@@ -195,30 +173,77 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	if closeFrontierStore {
 		defer func() { _ = fs.Close() }()
 	}
-	blockingEnqueuer, hasBlockingEnqueuer := any(fs).(frontierBlockingEnqueuer[T])
+	blockingEnqueuer, hasBlockingEnqueuer := any(fs).(iruntime.FrontierBlockingEnqueuer[T])
 
 	var enqueueDirect func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error
 	var enqueueGuarded func(stageName string, in T, hops int) error
-	guardedDeps := guardedEnqueueDeps[T]{
-		ctx:                  ctx,
-		runCtx:               runCtx,
-		runID:                runID,
-		runOpts:              runOpts,
-		dedupRulesByStage:    dedupRulesByStage,
-		seenMu:               &seenMu,
-		seen:                 seen,
-		frontierMu:           &frontierMu,
-		acceptedJobs:         &acceptedJobs,
-		reservedJobs:         &reservedJobs,
-		useFrontier:          useFrontier,
-		frontierStore:        fs,
-		blockingEnqueuer:     blockingEnqueuer,
-		hasBlockingEnqueuer:  hasBlockingEnqueuer,
-		frontierOutstandingW: &frontierOutstandingWG,
-	}
 	enqueueGuarded = func(stageName string, in T, hops int) error {
-		guardedDeps.enqueueDirect = enqueueDirect
-		return executeGuardedEnqueue(guardedDeps, stageName, in, hops)
+		return iruntime.ExecuteGuardedEnqueue(iruntime.GuardedEnqueueConfig[T]{
+			Ctx:                 ctx,
+			RunCtx:              runCtx,
+			RunID:               runID,
+			StageName:           stageName,
+			Input:               in,
+			Hops:                hops,
+			DedupRules:          runtimeDedupRulesByStage[stageName],
+			SeenMu:              &seenMu,
+			Seen:                seen,
+			CycleEnabled:        runOpts.CycleMode.Enabled,
+			CycleMaxHops:        runOpts.CycleMode.MaxHops,
+			CycleMaxJobs:        runOpts.CycleMode.MaxJobs,
+			AcceptedJobs:        &acceptedJobs,
+			ReservedJobs:        &reservedJobs,
+			FrontierMu:          &frontierMu,
+			UseFrontier:         useFrontier,
+			FrontierStore:       fs,
+			BlockingEnqueuer:    blockingEnqueuer,
+			HasBlockingEnqueuer: hasBlockingEnqueuer,
+			BlockingEnqueue:     runOpts.FrontierBlockingEnqueue,
+			FrontierOutstanding: &frontierOutstandingWG,
+			EnqueueDirect:       enqueueDirect,
+			BuildCycleMaxJobsErr: func(maxJobs int) error {
+				return CycleModeMaxJobsExceeded(maxJobs)
+			},
+			OnDedupDrop: func(scope string, key string, item T, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
+					RunID: runID,
+					Item:  item,
+					Key:   key,
+					At:    at,
+					Scope: DedupScope(scope),
+				})
+			},
+			OnCycleHopLimitDrop: func(stage string, item T, hops int, maxHops int, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
+					RunID:   runID,
+					Stage:   stage,
+					Item:    item,
+					Hops:    hops,
+					MaxHops: maxHops,
+					At:      at,
+				})
+			},
+			OnCycleMaxJobsDrop: func(stage string, item T, acceptedJobs int, maxJobs int, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.CycleMaxJobsExceeded, runCtx, CycleMaxJobsExceededEvent[T]{
+					RunID:        runID,
+					Stage:        stage,
+					Item:         item,
+					AcceptedJobs: acceptedJobs,
+					MaxJobs:      maxJobs,
+					At:           at,
+				})
+			},
+			OnFrontierEnqueue: func(entryID uint64, stage string, item T, hops int, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.FrontierEnqueue, runCtx, FrontierEnqueueEvent[T]{
+					RunID:   runID,
+					EntryID: entryID,
+					Stage:   stage,
+					Item:    item,
+					Hops:    hops,
+					At:      at,
+				})
+			},
+		})
 	}
 
 	poolsByStage, err = createPoolsByStage(stages, runOpts)
@@ -742,6 +767,22 @@ func buildDedupRulesByStage[T any](rules []DedupRule[T], stages map[string]Stage
 	return byStage, nil
 }
 
+func toRuntimeDedupRulesByStage[T any](byStage map[string][]DedupRule[T]) map[string][]iruntime.GuardedDedupRule[T] {
+	runtimeRules := make(map[string][]iruntime.GuardedDedupRule[T], len(byStage))
+	for stageName, rules := range byStage {
+		stageRules := make([]iruntime.GuardedDedupRule[T], 0, len(rules))
+		for _, rule := range rules {
+			stageRules = append(stageRules, iruntime.GuardedDedupRule[T]{
+				Name:  rule.Name,
+				Scope: string(rule.Scope),
+				Key:   rule.Key,
+			})
+		}
+		runtimeRules[stageName] = stageRules
+	}
+	return runtimeRules
+}
+
 func buildStageLimiters(stageRateLimits map[string]RateLimit) map[string]*rate.Limiter {
 	limiters := map[string]*rate.Limiter{}
 	for stageName, cfg := range stageRateLimits {
@@ -901,144 +942,6 @@ func startStagePools[T any](
 			}
 		}(poolErrCh)
 	}
-}
-
-func executeGuardedEnqueue[T any](deps guardedEnqueueDeps[T], stageName string, in T, hops int) error {
-	if deps.ctx.Err() != nil {
-		return deps.ctx.Err()
-	}
-
-	dedupInsertedKeys := make([]string, 0, 4)
-	var reservationTaken bool
-	var key string
-	rollbackDedup := func() {
-		if len(dedupInsertedKeys) == 0 {
-			return
-		}
-		deps.seenMu.Lock()
-		for _, k := range dedupInsertedKeys {
-			delete(deps.seen, k)
-		}
-		deps.seenMu.Unlock()
-	}
-
-	if dedupRules, ok := deps.dedupRulesByStage[stageName]; ok {
-		for _, rule := range dedupRules {
-			dedupKeyValue, derr := iruntime.SafeStringKey(rule.Key, in)
-			if derr != nil {
-				rollbackDedup()
-				return derr
-			}
-			key = stageName + "\x00" + dedupKeyValue
-			dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
-			if iruntime.SeenContainsOrInsert(deps.seenMu, deps.seen, dedupMapKey) {
-				iruntime.Call2(deps.runOpts.Hooks.DedupDrop, deps.runCtx, DedupDropEvent[T]{
-					RunID: deps.runID,
-					Item:  in,
-					Key:   key,
-					At:    time.Now(),
-					Scope: rule.Scope,
-				})
-				return nil
-			}
-			dedupInsertedKeys = append(dedupInsertedKeys, dedupMapKey)
-		}
-	}
-
-	if deps.runOpts.CycleMode.Enabled {
-		at := time.Now()
-		deps.frontierMu.Lock()
-		switch iruntime.EvaluateCycleGate(
-			deps.runOpts.CycleMode.Enabled,
-			deps.runOpts.CycleMode.MaxHops,
-			deps.runOpts.CycleMode.MaxJobs,
-			hops,
-			*deps.acceptedJobs,
-			*deps.reservedJobs,
-		) {
-		case iruntime.CycleGateDropHopLimit:
-			rollbackDedup()
-			deps.frontierMu.Unlock()
-			iruntime.Call2(deps.runOpts.Hooks.CycleHopLimitDrop, deps.runCtx, CycleHopLimitDropEvent[T]{
-				RunID:   deps.runID,
-				Stage:   stageName,
-				Item:    in,
-				Hops:    hops,
-				MaxHops: deps.runOpts.CycleMode.MaxHops,
-				At:      at,
-			})
-			return nil
-		case iruntime.CycleGateRejectMaxJobs:
-			rollbackDedup()
-			deps.frontierMu.Unlock()
-			iruntime.Call2(deps.runOpts.Hooks.CycleMaxJobsExceeded, deps.runCtx, CycleMaxJobsExceededEvent[T]{
-				RunID:        deps.runID,
-				Stage:        stageName,
-				Item:         in,
-				AcceptedJobs: *deps.acceptedJobs,
-				MaxJobs:      deps.runOpts.CycleMode.MaxJobs,
-				At:           at,
-			})
-			return CycleModeMaxJobsExceeded(deps.runOpts.CycleMode.MaxJobs)
-		}
-		*deps.reservedJobs = *deps.reservedJobs + 1
-		reservationTaken = true
-		deps.frontierMu.Unlock()
-	}
-
-	select {
-	case <-deps.ctx.Done():
-		deps.frontierMu.Lock()
-		if reservationTaken {
-			*deps.reservedJobs = *deps.reservedJobs - 1
-		}
-		rollbackDedup()
-		deps.frontierMu.Unlock()
-		return deps.ctx.Err()
-	default:
-	}
-
-	var (
-		err     error
-		entryID uint64
-	)
-	if deps.useFrontier {
-		if deps.runOpts.FrontierBlockingEnqueue && deps.hasBlockingEnqueuer {
-			entryID, err = deps.blockingEnqueuer.EnqueueWait(deps.runCtx, stageName, in, hops)
-		} else {
-			entryID, err = iruntime.EnqueueWithBackpressure(deps.runCtx, deps.frontierStore, stageName, in, hops)
-		}
-		if err == nil {
-			deps.frontierOutstandingW.Add(1)
-			iruntime.Call2(deps.runOpts.Hooks.FrontierEnqueue, deps.runCtx, FrontierEnqueueEvent[T]{
-				RunID:   deps.runID,
-				EntryID: entryID,
-				Stage:   stageName,
-				Item:    in,
-				Hops:    hops,
-				At:      time.Now(),
-			})
-		}
-	} else {
-		err = deps.enqueueDirect(stageName, in, hops, 0, 0)
-	}
-	if err != nil {
-		deps.frontierMu.Lock()
-		if reservationTaken {
-			*deps.reservedJobs = *deps.reservedJobs - 1
-		}
-		deps.frontierMu.Unlock()
-		rollbackDedup()
-		return err
-	}
-
-	deps.frontierMu.Lock()
-	if reservationTaken {
-		*deps.reservedJobs = *deps.reservedJobs - 1
-	}
-	*deps.acceptedJobs = *deps.acceptedJobs + 1
-	deps.frontierMu.Unlock()
-	return nil
 }
 
 func enqueueSeeds[T any](
