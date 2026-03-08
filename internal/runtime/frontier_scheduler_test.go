@@ -98,9 +98,9 @@ type reserveStore[T any] struct {
 }
 
 func (s *reserveStore[T]) Enqueue(stage string, item T, hops int) (uint64, error) { return 0, nil }
-func (s *reserveStore[T]) Ack(id uint64) error                                     { return nil }
-func (s *reserveStore[T]) Retry(id uint64, cause error) error                      { return nil }
-func (s *reserveStore[T]) Close() error                                            { return nil }
+func (s *reserveStore[T]) Ack(id uint64) error                                    { return nil }
+func (s *reserveStore[T]) Retry(id uint64, cause error) error                     { return nil }
+func (s *reserveStore[T]) Close() error                                           { return nil }
 func (s *reserveStore[T]) Reserve(ctx context.Context) (frontier.Entry[T], bool, error) {
 	if s.idx >= len(s.reserves) {
 		return frontier.Entry[T]{}, false, nil
@@ -122,9 +122,9 @@ type batchReserveStore[T any] struct {
 }
 
 func (s *batchReserveStore[T]) Enqueue(stage string, item T, hops int) (uint64, error) { return 0, nil }
-func (s *batchReserveStore[T]) Ack(id uint64) error                                     { return nil }
-func (s *batchReserveStore[T]) Retry(id uint64, cause error) error                      { return nil }
-func (s *batchReserveStore[T]) Close() error                                            { return nil }
+func (s *batchReserveStore[T]) Ack(id uint64) error                                    { return nil }
+func (s *batchReserveStore[T]) Retry(id uint64, cause error) error                     { return nil }
+func (s *batchReserveStore[T]) Close() error                                           { return nil }
 func (s *batchReserveStore[T]) Reserve(ctx context.Context) (frontier.Entry[T], bool, error) {
 	return frontier.Entry[T]{}, false, nil
 }

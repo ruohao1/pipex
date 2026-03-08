@@ -1,14 +1,14 @@
-# Pipex Architecture Boundaries and Extraction Plan
+# Pipex Architecture Boundaries and Runtime Map
 
 ## Purpose
 
 This document defines:
 
 1. Ownership boundaries for `internal/graph` and `internal/runtime`.
-2. Criteria for when code should move from root package files into `internal/`.
-3. The first migration slice to start using `internal/` without changing public API.
+2. Current runtime decomposition (`Pipeline.Run` facade -> runtime helpers).
+3. Rules for future extractions without API behavior changes.
 
-The current implementation remains rooted in `pipeline.go` and `compose.go`. The goal is to extract cohesive internals incrementally while preserving behavior.
+`Pipeline.Run` remains the public orchestration entrypoint. Internal execution details are progressively delegated to `internal/runtime`.
 
 ## 1) Ownership Boundaries
 
@@ -17,30 +17,27 @@ The current implementation remains rooted in `pipeline.go` and `compose.go`. The
 Scope:
 
 - Graph validation rules (stage existence checks, edge validity).
-- DAG cycle detection and future cycle-mode helpers.
-- Traversal helpers that are pure graph concerns (topological/frontier utilities).
-- Future dedup/frontier graph metadata (if graph-structural, not runtime-stateful).
+- DAG cycle detection and related graph utilities.
+- Pure graph traversal helpers.
 
 Non-scope:
 
 - Worker pools, goroutine lifecycle, context cancellation handling.
 - Trigger/sink execution logic.
-- Item processing orchestration.
+- Runtime scheduling and queue coordination.
 
 Design rule:
 
 - Keep `internal/graph` deterministic and side-effect light.
-- Prefer pure functions and immutable snapshots as inputs.
 
 ### `internal/runtime`
 
 Scope:
 
-- Pipeline run orchestration and lifecycle coordination.
-- Enqueue/drain mechanics, stage worker orchestration, waitgroup ordering.
-- Trigger and sink coordination across run lifecycle.
-- Error aggregation and cancellation policy application.
-- Future runtime policies (stage retry/timeout, rate limit enforcement hooks).
+- Pipeline run orchestration helpers and lifecycle coordination.
+- Frontier scheduler, enqueue, and gate logic.
+- Stage execution policy loops (attempt/retry/timeout behavior).
+- Concurrency helpers around queueing/scheduling.
 
 Non-scope:
 
@@ -49,64 +46,61 @@ Non-scope:
 
 Design rule:
 
-- `internal/runtime` owns concurrency semantics; external packages should not reimplement them.
-- Runtime should execute against stable stage metadata captured at run start (for example, worker count), not mutable values that may drift mid-lifecycle.
+- `internal/runtime` owns reusable execution mechanics.
+- Root package (`pipex`) remains the policy facade that maps runtime hooks/errors to public contracts.
 
-## 2) Extraction Criteria
+## 2) Current Runtime Map
 
-Move code from root into `internal/` only when all conditions hold:
+`Pipeline.Run` currently delegates these responsibilities:
+
+- `validateRunPreflight(...)`: run-time input/option preflight checks.
+- `buildDedupRulesByStage(...)`: dedup rules validation and expansion.
+- `buildStageLimiters(...)`: per-stage rate limiter setup.
+- `createPoolsByStage(...)`: pool creation and worker snapshot.
+- `startSinkWorkers(...)`: sink worker lifecycle.
+- `startStagePools(...)`: stage pool startup and error fan-in.
+- `enqueueSeeds(...)`: initial seed enqueue path.
+- `startTriggerWorkers(...)`: trigger lifecycle and emit path.
+- `waitForFrontierOutstanding(...)`: frontier drain/wait shutdown path.
+- `setupFrontierRuntime(...)`: frontier store/stats/requeue setup.
+
+`internal/runtime` currently provides:
+
+- `RunFrontierScheduler(...)` (`frontier_scheduler.go`): reserve/dispatch loop.
+- `EnqueueWithBackpressure(...)` (`frontier_enqueue.go`): non-blocking frontier backpressure retry.
+- `SafeStringKey(...)` (`dedup.go`): panic-safe dedup key evaluation.
+- `EvaluateCycleGate(...)` and `SeenContainsOrInsert(...)` (`gates.go`): cycle/dedup gate utilities.
+- `ExecuteGuardedEnqueue(...)` (`guarded_enqueue.go`): guarded enqueue orchestration.
+- `EnqueueDirect(...)` (`direct_enqueue.go`): direct queue enqueue mechanics.
+- `ExecuteStageWithPolicy(...)` (`stage_execute.go`): attempt/retry/timeout execution loop.
+
+## 3) Extraction Rules
+
+Move logic from `pipeline.go` to `internal/runtime` only when all conditions hold:
 
 1. Cohesion is clear.
-- The code cluster serves one concern (`graph` or `runtime`) without requiring broad cross-file context.
+- The extracted code serves one execution concern and has a narrow config surface.
 
 2. Public API stability is preserved.
-- No exported type/function signatures need to change.
-- Root package remains the stable facade (`Pipeline.Run`, `Validate`, composition helpers).
+- No exported signatures change.
+- `Pipeline.Run` remains the single public runtime entrypoint.
 
-3. Behavioral parity is provable.
-- Existing tests still express the same semantics.
-- No expected ordering/cancellation/error behavior changes in the migration commit.
+3. Behavioral parity is proven.
+- Existing integration tests stay green.
+- Add focused `internal/runtime` tests for each extracted helper.
 
-4. Complexity threshold is reached.
-- A function/file mixes multiple concerns (for example, validation + orchestration), making maintenance harder than delegation.
+4. Dependency direction stays clean.
+- Root package may depend on `internal/runtime`.
+- `internal/runtime` must not import root package types.
 
-5. Dependency direction remains clean.
-- Root package may delegate to `internal/*`.
-- `internal/graph` must not depend on `internal/runtime`.
-- `internal/runtime` can depend on `internal/graph` only via narrow inputs if needed.
+5. Error/hook mapping remains in root package when domain-specific.
+- Runtime helpers should expose callback hooks/results.
+- Root package converts callbacks/results into public events/errors.
 
-6. Migration unit is independently reviewable.
-- A single extraction change should be understandable without requiring future planned refactors.
+## 4) Next Targets
 
-## 3) First Migration Slice
-
-### Target
-
-Extract graph validation logic from `pipeline.go` into `internal/graph` first.
-
-Recommended extraction scope:
-
-- Stage/edge existence checks currently in validation path.
-- DAG cycle detection currently in `validateSnapshot`.
-
-Keep in root package:
-
-- Public method entry points (`Validate`, `Run` preflight checks).
-- Error construction and public error types in `errors.go`.
-
-### Why this first
-
-- Lowest risk: graph validation is relatively pure and easier to isolate.
-- High clarity gain: reduces mixed responsibilities in `pipeline.go`.
-- No runtime-concurrency behavior impact.
-
-### Migration shape
-
-1. Introduce internal graph validator API that accepts stage/edge snapshots.
-2. Delegate `validateSnapshot` internals to `internal/graph`.
-3. Keep outward error behavior unchanged (`ErrNoStages`, `ErrCycle`, `StageNotFound` wrapping semantics).
-4. Keep all existing tests green with no behavioral edits.
-
-### Deferred until later
-
-Do not extract runtime orchestration yet (`Run` goroutine choreography, sink/trigger lifecycle), because hooks/retry policy design may still evolve and would cause churn.
+- Continue reducing closure-heavy wiring in `Pipeline.Run` by grouping helper configs into smaller typed bundles.
+- Keep extraction slices small and independently reviewable.
+- Maintain parity checks with:
+  - `go test ./...`
+  - `go test -race ./...`
