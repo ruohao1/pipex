@@ -1,6 +1,13 @@
 # pipex
 A library to help you create pipelines in Golang
 
+## Positioning
+
+`pipex` is an execution engine library, not the scanner product (`penta`):
+https://github.com/ruohao1/penta
+
+Boundary and ownership are defined in `docs/boundary.md`.
+
 ## Installation
 
 Requires Go `1.25+`.
@@ -20,6 +27,7 @@ go get github.com/ruohao1/pipex@latest
 - Dedup rules: `docs/dedup.md`
 - Frontier mode: `docs/frontier.md`
 - Product plan: `docs/product-plan.md`
+- Engine-scanner boundary: `docs/boundary.md`
 
 ## Run Options
 

@@ -2,6 +2,15 @@
 
 This document tracks feature planning, milestones, and active TODOs for `pipex`.
 
+## Direction Lock (Current)
+
+- Primary audience: builders of security automation/scanner workflows.
+- Product boundary: `pipex` remains a domain-neutral execution engine.
+- Application boundary: `penta` (https://github.com/ruohao1/penta) owns scanner-specific semantics and UX.
+- Strategic priority: recoverable and resumable runtime primitives.
+- Explicit non-goal: adding scanner-specific concepts to `pipex` public API.
+- Delivery rule for this phase: favor clarity, boundary enforcement, and runtime hardening over feature breadth.
+
 ## Planning Goals
 
 - Position `pipex` as a recoverable workflow runtime for security automation.
