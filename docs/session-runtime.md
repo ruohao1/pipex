@@ -125,3 +125,37 @@ if tm.PauseCount != 1 || tm.ResumeCount != 1 {
 active := pipex.GetRunTelemetrySnapshot(true) // excludes canceled/completed
 all := pipex.GetRunTelemetrySnapshot(false)   // includes terminal runs
 ```
+
+## Public Run Control and Status APIs
+
+For integration boundaries (such as `penta`), prefer public `pipex` APIs by
+`run_id`:
+
+- `pipex.PauseRun(runID) bool`
+- `pipex.ResumeRun(runID) bool`
+- `pipex.CancelRun(runID) bool`
+- `pipex.PauseRunE(runID) (bool, error)`
+- `pipex.ResumeRunE(runID) (bool, error)`
+- `pipex.CancelRunE(runID) (bool, error)`
+- `pipex.GetRunStatus(runID) (pipex.RunStatus, bool)`
+
+`GetRunStatus` is a lightweight polling shape:
+
+```go
+type RunStatus struct {
+	RunID     string
+	State     RunState // running|paused|canceled|completed
+	UpdatedAt time.Time
+}
+```
+
+### Control API Outcomes (`*E` variants)
+
+`PauseRunE`, `ResumeRunE`, and `CancelRunE` distinguish "unknown run" from
+"known run but no state transition":
+
+| Case | Return |
+| --- | --- |
+| Unknown `run_id` | `changed=false`, `err=pipex.ErrRunNotFound` |
+| Known `run_id`, idempotent no-op (already in target/terminal state) | `changed=false`, `err=nil` |
+| Known `run_id`, state transitioned | `changed=true`, `err=nil` |
