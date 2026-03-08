@@ -77,6 +77,47 @@ func TestWithCycleModeSetsOptions(t *testing.T) {
 	}
 }
 
+func TestWithFrontierSetsOption(t *testing.T) {
+	opts := defaultOptions[int]()
+	if opts.UseFrontier {
+		t.Fatal("expected default frontier mode disabled")
+	}
+
+	WithFrontier[int](true)(opts)
+	if !opts.UseFrontier {
+		t.Fatal("expected frontier mode enabled")
+	}
+}
+
+func TestWithFrontierPendingCapacitySetsOption(t *testing.T) {
+	opts := defaultOptions[int]()
+	if opts.FrontierPendingCap != 0 {
+		t.Fatalf("expected default frontier pending cap 0, got %d", opts.FrontierPendingCap)
+	}
+
+	WithFrontierPendingCapacity[int](4096)(opts)
+	if opts.FrontierPendingCap != 4096 {
+		t.Fatalf("unexpected frontier pending cap: got %d want 4096", opts.FrontierPendingCap)
+	}
+
+	WithFrontierPendingCapacity[int](0)(opts)
+	if opts.FrontierPendingCap != 4096 {
+		t.Fatalf("expected non-positive value to be ignored, got %d", opts.FrontierPendingCap)
+	}
+}
+
+func TestWithFrontierBlockingEnqueueSetsOption(t *testing.T) {
+	opts := defaultOptions[int]()
+	if opts.FrontierBlockingEnqueue {
+		t.Fatal("expected default frontier blocking enqueue disabled")
+	}
+
+	WithFrontierBlockingEnqueue[int](true)(opts)
+	if !opts.FrontierBlockingEnqueue {
+		t.Fatal("expected frontier blocking enqueue enabled")
+	}
+}
+
 func TestWithStageWorkersSetsCopiedMap(t *testing.T) {
 	opts := defaultOptions[int]()
 	in := map[string]int{"a": 2}

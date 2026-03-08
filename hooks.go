@@ -45,6 +45,13 @@ type Hooks[T any] struct {
 	CycleMaxJobsExceeded func(ctx context.Context, e CycleMaxJobsExceededEvent[T])
 
 	DedupDrop func(ctx context.Context, e DedupDropEvent[T])
+
+	FrontierEnqueue        func(ctx context.Context, e FrontierEnqueueEvent[T])
+	FrontierReserve        func(ctx context.Context, e FrontierReserveEvent[T])
+	FrontierAck            func(ctx context.Context, e FrontierAckEvent[T])
+	FrontierRetry          func(ctx context.Context, e FrontierRetryEvent[T])
+	FrontierStats          func(ctx context.Context, e FrontierStatsEvent)
+	FrontierRequeueExpired func(ctx context.Context, e FrontierRequeueExpiredEvent)
 }
 
 // Stage events
@@ -222,4 +229,65 @@ type DedupDropEvent[T any] struct {
 	Key   string
 	Item  T
 	At    time.Time
+}
+
+type FrontierEnqueueEvent[T any] struct {
+	RunID   string
+	EntryID uint64
+	Stage   string
+	Item    T
+	Hops    int
+	At      time.Time
+}
+
+type FrontierReserveEvent[T any] struct {
+	RunID   string
+	EntryID uint64
+	Stage   string
+	Input   T
+	Hops    int
+	Attempt int
+	At      time.Time
+}
+
+type FrontierAckEvent[T any] struct {
+	RunID   string
+	EntryID uint64
+	Stage   string
+	Input   T
+	Hops    int
+	Attempt int
+	At      time.Time
+}
+
+type FrontierRetryEvent[T any] struct {
+	RunID   string
+	EntryID uint64
+	Stage   string
+	Input   T
+	Hops    int
+	Attempt int
+	Err     error
+	At      time.Time
+}
+
+type FrontierStatsEvent struct {
+	RunID             string
+	Pending           int64
+	Inflight          int64
+	Acked             int64
+	Retried           int64
+	Dropped           int64
+	TerminalFailed    int64
+	Canceled          int64
+	EnqueueFull       int64
+	PendingQueueDepth int
+	At                time.Time
+}
+
+type FrontierRequeueExpiredEvent struct {
+	RunID   string
+	EntryID uint64
+	Count   int
+	At      time.Time
 }

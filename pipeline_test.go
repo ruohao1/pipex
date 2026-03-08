@@ -1692,3 +1692,251 @@ func TestRunCycleModeMaxJobsBoundUnderConcurrentEnqueue(t *testing.T) {
 		}
 	}
 }
+
+func TestRunFrontierParityDedup(t *testing.T) {
+	for _, useFrontier := range []bool{false, true} {
+		t.Run(fmt.Sprintf("frontier=%v", useFrontier), func(t *testing.T) {
+			p := NewPipeline[int]()
+			_ = p.AddStage(testStage[int]{name: "a", workers: 2})
+
+			res, err := p.Run(
+				context.Background(),
+				map[string][]int{"a": {1, 1, 2, 2, 3}},
+				WithFrontier[int](useFrontier),
+				WithDedupRules[int](DedupRule[int]{
+					Name:  "uniq",
+					Scope: DedupScopeGlobal,
+					Key: func(v int) string {
+						return fmt.Sprintf("%d", v)
+					},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("unexpected run error: %v", err)
+			}
+			if got := len(res["a"]); got != 3 {
+				t.Fatalf("unexpected dedup count: got %d want 3", got)
+			}
+		})
+	}
+}
+
+func TestRunFrontierParityCycleMaxHops(t *testing.T) {
+	for _, useFrontier := range []bool{false, true} {
+		t.Run(fmt.Sprintf("frontier=%v", useFrontier), func(t *testing.T) {
+			p := NewPipeline[int]()
+			_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+			_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+			_ = p.Connect("a", "b")
+			_ = p.Connect("b", "a")
+
+			res, err := p.Run(
+				context.Background(),
+				map[string][]int{"a": {1}},
+				WithFrontier[int](useFrontier),
+				WithCycleMode[int](2, 100),
+			)
+			if err != nil {
+				t.Fatalf("unexpected run error: %v", err)
+			}
+			if got := len(res["a"]); got != 2 {
+				t.Fatalf("unexpected stage a count: got %d want 2", got)
+			}
+			if got := len(res["b"]); got != 1 {
+				t.Fatalf("unexpected stage b count: got %d want 1", got)
+			}
+		})
+	}
+}
+
+func TestRunFrontierParityCycleMaxJobsExceeded(t *testing.T) {
+	for _, useFrontier := range []bool{false, true} {
+		t.Run(fmt.Sprintf("frontier=%v", useFrontier), func(t *testing.T) {
+			p := NewPipeline[int]()
+			_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+			_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+			_ = p.Connect("a", "b")
+			_ = p.Connect("b", "a")
+
+			_, err := p.Run(
+				context.Background(),
+				map[string][]int{"a": {1}},
+				WithFrontier[int](useFrontier),
+				WithCycleMode[int](-1, 2),
+				WithFailFast[int](true),
+			)
+			if !errors.Is(err, ErrCycleModeMaxJobsExceeded) {
+				t.Fatalf("expected ErrCycleModeMaxJobsExceeded, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRunFrontierParityCancellation(t *testing.T) {
+	for _, useFrontier := range []bool{false, true} {
+		t.Run(fmt.Sprintf("frontier=%v", useFrontier), func(t *testing.T) {
+			p := NewPipeline[int]()
+			_ = p.AddStage(testStage[int]{
+				name:    "a",
+				workers: 1,
+				fn: func(ctx context.Context, in int) ([]int, error) {
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(200 * time.Millisecond):
+						return []int{in}, nil
+					}
+				},
+			})
+
+			runCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+
+			_, err := p.Run(
+				runCtx,
+				map[string][]int{"a": {1}},
+				WithFrontier[int](useFrontier),
+				WithFailFast[int](true),
+			)
+			if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+				t.Fatalf("expected cancellation error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRunFrontierRetryPathDoesNotUnderflowOutstandingCounter(t *testing.T) {
+	p := NewPipeline[int]()
+	var calls atomic.Int64
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			if calls.Add(1) == 1 {
+				return nil, errors.New("transient")
+			}
+			return []int{in}, nil
+		},
+	})
+
+	_, _ = p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithFrontier[int](true),
+		WithStagePolicies[int](map[string]StagePolicy{
+			"a": {MaxAttempts: 1},
+		}),
+	)
+}
+
+func TestRunFrontierStageExhaustionIsTerminal(t *testing.T) {
+	p := NewPipeline[int]()
+	wantErr := errors.New("boom")
+	var calls atomic.Int64
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			calls.Add(1)
+			return nil, wantErr
+		},
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": {1}},
+			WithFrontier[int](true),
+			WithFailFast[int](false),
+			WithStagePolicies[int](map[string]StagePolicy{
+				"a": {MaxAttempts: 2},
+			}),
+		)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("expected stage error %v, got %v", wantErr, err)
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("expected exactly 2 stage attempts with no frontier requeue, got %d", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run appears stuck; exhausted frontier work should be terminal")
+	}
+}
+
+func TestRunFrontierFailFastCancellationDoesNotHangWithPendingEntries(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			if in == 0 {
+				return nil, errors.New("boom")
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+				return []int{in}, nil
+			}
+		},
+	})
+
+	seeds := make([]int, 500)
+	for i := range seeds {
+		seeds[i] = i
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(
+			context.Background(),
+			map[string][]int{"a": seeds},
+			WithFrontier[int](true),
+			WithFailFast[int](true),
+		)
+		done <- err
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run appears stuck under fail-fast cancellation with pending frontier entries")
+	}
+}
+
+func TestRunFrontierStatsHookSampled(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			time.Sleep(5 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+
+	var samples atomic.Int64
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2, 3, 4}},
+		WithFrontier[int](true),
+		WithFrontierStatsInterval[int](1*time.Millisecond),
+		WithHooks[int](Hooks[int]{
+			FrontierStats: func(ctx context.Context, e FrontierStatsEvent) {
+				samples.Add(1)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if samples.Load() == 0 {
+		t.Fatal("expected at least one frontier stats sample")
+	}
+}

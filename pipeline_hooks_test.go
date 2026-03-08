@@ -829,3 +829,54 @@ func TestHooksConcurrencyUnderLoad(t *testing.T) {
 		t.Fatalf("unexpected StageFinish count: got %d want %d", got, 2*n)
 	}
 }
+
+func TestFrontierHooksEmitted(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{name: "a", workers: 1})
+	_ = p.AddStage(testStage[int]{name: "b", workers: 1})
+	_ = p.Connect("a", "b")
+
+	var (
+		enqueueCount atomic.Int64
+		reserveCount atomic.Int64
+		ackCount     atomic.Int64
+		retryCount   atomic.Int64
+	)
+	hooks := Hooks[int]{
+		FrontierEnqueue: func(ctx context.Context, e FrontierEnqueueEvent[int]) {
+			enqueueCount.Add(1)
+		},
+		FrontierReserve: func(ctx context.Context, e FrontierReserveEvent[int]) {
+			reserveCount.Add(1)
+		},
+		FrontierAck: func(ctx context.Context, e FrontierAckEvent[int]) {
+			ackCount.Add(1)
+		},
+		FrontierRetry: func(ctx context.Context, e FrontierRetryEvent[int]) {
+			retryCount.Add(1)
+		},
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithFrontier[int](true),
+		WithHooks[int](hooks),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	if got := enqueueCount.Load(); got == 0 {
+		t.Fatal("expected frontier enqueue hooks")
+	}
+	if got := reserveCount.Load(); got == 0 {
+		t.Fatal("expected frontier reserve hooks")
+	}
+	if got := ackCount.Load(); got == 0 {
+		t.Fatal("expected frontier ack hooks")
+	}
+	if got := retryCount.Load(); got != 0 {
+		t.Fatalf("expected no frontier retry hook on success path, got %d", got)
+	}
+}

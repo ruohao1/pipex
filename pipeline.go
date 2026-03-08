@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ruohao1/pipex/internal/frontier"
 	iruntime "github.com/ruohao1/pipex/internal/runtime"
 	"golang.org/x/time/rate"
 
@@ -84,88 +85,8 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		iruntime.Call3(runOpts.Hooks.RunEnd, ctx, runMeta, retErr)
 	}()
 
-	if runOpts.CycleMode.Enabled {
-		if runOpts.CycleMode.MaxHops < -1 {
-			retErr = ErrCycleModeInvalidMaxHops
-			return nil, retErr
-		}
-		if runOpts.CycleMode.MaxJobs <= 0 {
-			retErr = ErrCycleModeInvalidMaxJobs
-			return nil, retErr
-		}
-	}
-
-	if err := p.validateSnapshot(stages, edges, runOpts.CycleMode.Enabled); err != nil {
+	if err := p.validateRunPreflight(ctx, stages, edges, seeds, runOpts); err != nil {
 		retErr = err
-		return nil, retErr
-	}
-
-	for seedStage := range seeds {
-		if _, ok := stages[seedStage]; !ok {
-			retErr = StageNotFound(seedStage)
-			return nil, retErr
-		}
-	}
-	for _, trigger := range runOpts.Triggers {
-		if _, ok := stages[trigger.Stage()]; !ok {
-			retErr = fmt.Errorf("trigger %s: %w", trigger.Name(), StageNotFound(trigger.Stage()))
-			return nil, retErr
-		}
-	}
-	for _, sink := range runOpts.Sinks {
-		if _, ok := stages[sink.Stage()]; !ok {
-			retErr = fmt.Errorf("sink %s: %w", sink.Name(), StageNotFound(sink.Stage()))
-			return nil, retErr
-		}
-	}
-
-	for stageName, count := range runOpts.StageWorkers {
-		if _, ok := stages[stageName]; !ok {
-			retErr = fmt.Errorf("stage workers config: %w", StageNotFound(stageName))
-			return nil, retErr
-		}
-		if count <= 0 {
-			retErr = fmt.Errorf("stage %s: invalid worker count %d: %w", stageName, count, ErrInvalidWorkerCount)
-			return nil, retErr
-		}
-	}
-
-	for stageName, rate := range runOpts.StageRateLimits {
-		if _, ok := stages[stageName]; !ok {
-			retErr = fmt.Errorf("stage rate limits config: %w", StageNotFound(stageName))
-			return nil, retErr
-		}
-		if rate.RPS <= 0 {
-			retErr = fmt.Errorf("stage %s: invalid RPS %f: %w", stageName, rate.RPS, ErrInvalidRPS)
-			return nil, retErr
-		}
-		if rate.Burst < 1 {
-			retErr = fmt.Errorf("stage %s: invalid burst %d: %w", stageName, rate.Burst, ErrInvalidBurst)
-			return nil, retErr
-		}
-	}
-
-	for stageName, policy := range runOpts.StagePolicies {
-		if _, ok := stages[stageName]; !ok {
-			retErr = fmt.Errorf("stage policies config: %w", StageNotFound(stageName))
-			return nil, retErr
-		}
-		if policy.MaxAttempts < 1 {
-			retErr = fmt.Errorf("invalid stage policy max attempts %d: %w", policy.MaxAttempts, ErrInvalidStagePolicyMaxAttempts)
-			return nil, retErr
-		}
-		if policy.Backoff < 0 {
-			retErr = fmt.Errorf("invalid stage policy backoff %s: %w", policy.Backoff, ErrInvalidStagePolicyBackoff)
-			return nil, retErr
-		}
-		if policy.Timeout < 0 {
-			retErr = fmt.Errorf("invalid stage policy timeout %s: %w", policy.Timeout, ErrInvalidStagePolicyTimeout)
-			return nil, retErr
-		}
-	}
-
-	if ctx.Err() != nil {
-		retErr = ctx.Err()
 		return nil, retErr
 	}
 
@@ -175,45 +96,17 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	var poolErrWG sync.WaitGroup
 	var triggersWG sync.WaitGroup
 	var sinksWG sync.WaitGroup
+	var frontierOutstandingWG sync.WaitGroup
 
 	jobsByStage := make(map[string]chan Job, len(stages))
 	poolsByStage := make(map[string]*Pool, len(stages))
 	sinksByStage := make(map[string][]chan T)
-	dedupRulesByStage := make(map[string][]DedupRule[T])
-
-	for _, rule := range runOpts.DedupRules {
-		if rule.Name == "" {
-			retErr = ErrInvalidDedupRuleName
-			return nil, retErr
-		}
-		if rule.Key == nil {
-			retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleKey)
-			return nil, retErr
-		}
-		if rule.Scope == "" {
-			retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleScope)
-			return nil, retErr
-		}
-		stageScope, isStageScope := parseStageScope(rule.Scope)
-		if !isStageScope && rule.Scope != DedupScopeGlobal {
-			retErr = fmt.Errorf("dedup rule %s: invalid scope %s: %w", rule.Name, rule.Scope, ErrInvalidDedupRuleScope)
-			return nil, retErr
-		}
-
-		if isStageScope {
-			if _, ok := stages[stageScope]; !ok {
-				retErr = fmt.Errorf("dedup rule %s: %w", rule.Name, StageNotFound(stageScope))
-				return nil, retErr
-			}
-			dedupRulesByStage[stageScope] = append(dedupRulesByStage[stageScope], rule)
-		}
-
-		if !isStageScope || rule.Scope == DedupScopeGlobal {
-			for stageName := range stages {
-				dedupRulesByStage[stageName] = append(dedupRulesByStage[stageName], rule)
-			}
-		}
+	dedupRulesByStage, err := buildDedupRulesByStage(runOpts.DedupRules, stages)
+	if err != nil {
+		retErr = err
+		return nil, retErr
 	}
+	runtimeDedupRulesByStage := toRuntimeDedupRulesByStage(dedupRulesByStage)
 
 	var errsMu sync.Mutex
 	var runErrs []error
@@ -223,11 +116,14 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	reservedJobs := 0
 	seen := make(map[string]struct{})
 	var seenMu sync.Mutex
+	var frontierStatsWG sync.WaitGroup
+	stopFrontierStats := func() {}
+	defer func() {
+		stopFrontierStats()
+		frontierStatsWG.Wait()
+	}()
 
-	limiters := map[string]*rate.Limiter{}
-	for stageName, cfg := range runOpts.StageRateLimits {
-		limiters[stageName] = rate.NewLimiter(rate.Limit(cfg.RPS), cfg.Burst)
-	}
+	limiters := buildStageLimiters(runOpts.StageRateLimits)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -260,138 +156,106 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		addErr(err)
 	}
 
-	// Snapshot stage worker configuration and ensure all pools can be created
-	// before starting any worker goroutine. This avoids partial startup leaks
-	// if one stage has an invalid worker count at run time.
-	for stageName, stage := range stages {
-		pool, err := NewPool(PoolConfig{
-			Workers: func() int {
-				if count, ok := runOpts.StageWorkers[stageName]; ok {
-					return count
-				}
-				return stage.Workers()
-			}(),
-			Queue:         runOpts.BufferSize,
-			DrainOnCancel: true,
+	useFrontier := runOpts.UseFrontier
+	fs, closeFrontierStore, err := setupFrontierRuntime(
+		runCtx,
+		runID,
+		runOpts,
+		len(stages),
+		&frontierStatsWG,
+		&stopFrontierStats,
+		recordErr,
+	)
+	if err != nil {
+		retErr = err
+		return nil, retErr
+	}
+	if closeFrontierStore {
+		defer func() { _ = fs.Close() }()
+	}
+	blockingEnqueuer, hasBlockingEnqueuer := any(fs).(iruntime.FrontierBlockingEnqueuer[T])
+
+	var enqueueDirect func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error
+	var enqueueGuarded func(stageName string, in T, hops int) error
+	enqueueGuarded = func(stageName string, in T, hops int) error {
+		return iruntime.ExecuteGuardedEnqueue(iruntime.GuardedEnqueueConfig[T]{
+			Ctx:                 ctx,
+			RunCtx:              runCtx,
+			RunID:               runID,
+			StageName:           stageName,
+			Input:               in,
+			Hops:                hops,
+			DedupRules:          runtimeDedupRulesByStage[stageName],
+			SeenMu:              &seenMu,
+			Seen:                seen,
+			CycleEnabled:        runOpts.CycleMode.Enabled,
+			CycleMaxHops:        runOpts.CycleMode.MaxHops,
+			CycleMaxJobs:        runOpts.CycleMode.MaxJobs,
+			AcceptedJobs:        &acceptedJobs,
+			ReservedJobs:        &reservedJobs,
+			FrontierMu:          &frontierMu,
+			UseFrontier:         useFrontier,
+			FrontierStore:       fs,
+			BlockingEnqueuer:    blockingEnqueuer,
+			HasBlockingEnqueuer: hasBlockingEnqueuer,
+			BlockingEnqueue:     runOpts.FrontierBlockingEnqueue,
+			FrontierOutstanding: &frontierOutstandingWG,
+			EnqueueDirect:       enqueueDirect,
+			BuildCycleMaxJobsErr: func(maxJobs int) error {
+				return CycleModeMaxJobsExceeded(maxJobs)
+			},
+			OnDedupDrop: func(scope string, key string, item T, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
+					RunID: runID,
+					Item:  item,
+					Key:   key,
+					At:    at,
+					Scope: DedupScope(scope),
+				})
+			},
+			OnCycleHopLimitDrop: func(stage string, item T, hops int, maxHops int, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
+					RunID:   runID,
+					Stage:   stage,
+					Item:    item,
+					Hops:    hops,
+					MaxHops: maxHops,
+					At:      at,
+				})
+			},
+			OnCycleMaxJobsDrop: func(stage string, item T, acceptedJobs int, maxJobs int, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.CycleMaxJobsExceeded, runCtx, CycleMaxJobsExceededEvent[T]{
+					RunID:        runID,
+					Stage:        stage,
+					Item:         item,
+					AcceptedJobs: acceptedJobs,
+					MaxJobs:      maxJobs,
+					At:           at,
+				})
+			},
+			OnFrontierEnqueue: func(entryID uint64, stage string, item T, hops int, at time.Time) {
+				iruntime.Call2(runOpts.Hooks.FrontierEnqueue, runCtx, FrontierEnqueueEvent[T]{
+					RunID:   runID,
+					EntryID: entryID,
+					Stage:   stage,
+					Item:    item,
+					Hops:    hops,
+					At:      at,
+				})
+			},
 		})
-		if err != nil {
-			retErr = fmt.Errorf("stage %s: failed to create worker pool: %w", stageName, err)
-			return nil, retErr
-		}
-		poolsByStage[stageName] = pool
 	}
 
-	for _, sink := range runOpts.Sinks {
-		sinkCh := make(chan T, runOpts.BufferSize)
-		sinksByStage[sink.Stage()] = append(sinksByStage[sink.Stage()], sinkCh)
-
-		sinksWG.Add(1)
-		go func(sink Sink[T], sinkCh chan T) {
-			defer sinksWG.Done()
-			disabled := false
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case item, ok := <-sinkCh:
-					if !ok {
-						return
-					}
-					if disabled {
-						continue
-					}
-
-					attempts := 0
-					for {
-						startTime := time.Now()
-						iruntime.Call2(runOpts.Hooks.SinkConsumeStart, runCtx, SinkConsumeStartEvent[T]{
-							RunID:     runID,
-							Sink:      sink.Name(),
-							Stage:     sink.Stage(),
-							Item:      item,
-							Attempt:   attempts + 1,
-							StartedAt: startTime,
-						})
-						err := sink.Consume(ctx, item)
-						finishTime := time.Now()
-						duration := finishTime.Sub(startTime)
-
-						if err == nil {
-							iruntime.Call2(runOpts.Hooks.SinkConsumeSuccess, runCtx, SinkConsumeSuccessEvent[T]{
-								RunID:      runID,
-								Sink:       sink.Name(),
-								Stage:      sink.Stage(),
-								Item:       item,
-								Attempt:    attempts + 1,
-								StartedAt:  startTime,
-								FinishedAt: finishTime,
-								Duration:   duration,
-							})
-							break
-						}
-						attempts++
-
-						if runOpts.SinkRetry.MaxRetries >= 0 && attempts > runOpts.SinkRetry.MaxRetries {
-							iruntime.Call2(runOpts.Hooks.SinkExhausted, runCtx, SinkExhaustedEvent[T]{
-								RunID:    runID,
-								Sink:     sink.Name(),
-								Stage:    sink.Stage(),
-								Item:     item,
-								Err:      err,
-								Attempts: attempts,
-								At:       time.Now(),
-							})
-							recordErr(fmt.Errorf("sink %s: retries exhausted: %w", sink.Name(), err))
-							disabled = true
-							break
-						}
-
-						if ctx.Err() != nil {
-							recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
-							return
-						}
-
-						iruntime.Call2(runOpts.Hooks.SinkRetry, runCtx, SinkRetryEvent[T]{
-							RunID:   runID,
-							Sink:    sink.Name(),
-							Stage:   sink.Stage(),
-							Item:    item,
-							Attempt: attempts,
-							Err:     err,
-							Backoff: runOpts.SinkRetry.Backoff,
-							At:      time.Now(),
-						})
-
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(runOpts.SinkRetry.Backoff):
-						}
-					}
-				}
-			}
-		}(sink, sinkCh)
+	poolsByStage, err = createPoolsByStage(stages, runOpts)
+	if err != nil {
+		retErr = err
+		return nil, retErr
 	}
 
-	for stageName := range stages {
-		stageJobs := make(chan Job, runOpts.BufferSize)
-		jobsByStage[stageName] = stageJobs
+	startSinkWorkers(ctx, runCtx, runID, runOpts, sinksByStage, &sinksWG, recordErr)
+	startStagePools(runCtx, stages, runOpts, poolsByStage, jobsByStage, &poolErrWG, recordErr)
 
-		pool := poolsByStage[stageName]
-
-		poolErrWG.Add(1)
-		// Stage pools drain queued jobs after cancellation so tasksWG can reach zero.
-		poolErrCh := pool.Run(runCtx, stageJobs)
-		go func(poolErrCh <-chan error) {
-			defer poolErrWG.Done()
-			for err := range poolErrCh {
-				recordErr(err)
-			}
-		}(poolErrCh)
-	}
-
-	var enqueue func(stageName string, in T, hops int) error
-	enqueue = func(stageName string, in T, hops int) error {
+	enqueueDirect = func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error {
 		stageJobs, ok := jobsByStage[stageName]
 		if !ok {
 			return StageNotFound(stageName)
@@ -399,94 +263,15 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		dedupInsertedKeys := make([]string, 0, 4)
-		var reservationTaken bool
-		var key string
-		rollbackDedup := func() {
-			if len(dedupInsertedKeys) == 0 {
-				return
-			}
-			seenMu.Lock()
-			for _, k := range dedupInsertedKeys {
-				delete(seen, k)
-			}
-			seenMu.Unlock()
-		}
-
-		if dedupRules, ok := dedupRulesByStage[stageName]; ok {
-			for _, rule := range dedupRules {
-				dedupKeyValue, derr := func() (key string, err error) {
-					defer func() {
-						if r := recover(); r != nil {
-							err = fmt.Errorf("dedup key panic: %v", r)
-						}
-					}()
-					return rule.Key(in), nil
-				}()
-				if derr != nil {
-					rollbackDedup()
-					return derr
-				}
-				key = stageName + "\x00" + dedupKeyValue
-				dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
-				seenMu.Lock()
-				if _, exists := seen[dedupMapKey]; exists {
-					seenMu.Unlock()
-					iruntime.Call2(runOpts.Hooks.DedupDrop, runCtx, DedupDropEvent[T]{
-						RunID: runID,
-						Item:  in,
-						Key:   key,
-						At:    time.Now(),
-						Scope: rule.Scope,
-					})
-					return nil
-				}
-				seen[dedupMapKey] = struct{}{}
-				dedupInsertedKeys = append(dedupInsertedKeys, dedupMapKey)
-				seenMu.Unlock()
-			}
-		}
-		if runOpts.CycleMode.Enabled {
-			at := time.Now()
-			frontierMu.Lock()
-			if runOpts.CycleMode.MaxHops >= 0 && hops > runOpts.CycleMode.MaxHops {
-				rollbackDedup()
-				frontierMu.Unlock()
-				iruntime.Call2(runOpts.Hooks.CycleHopLimitDrop, runCtx, CycleHopLimitDropEvent[T]{
-					RunID:   runID,
-					Stage:   stageName,
-					Item:    in,
-					Hops:    hops,
-					MaxHops: runOpts.CycleMode.MaxHops,
-					At:      at,
-				})
-
-				return nil
-			}
-			if acceptedJobs+reservedJobs >= runOpts.CycleMode.MaxJobs {
-				rollbackDedup()
-				frontierMu.Unlock()
-				iruntime.Call2(runOpts.Hooks.CycleMaxJobsExceeded, runCtx, CycleMaxJobsExceededEvent[T]{
-					RunID:        runID,
-					Stage:        stageName,
-					Item:         in,
-					AcceptedJobs: acceptedJobs,
-					MaxJobs:      runOpts.CycleMode.MaxJobs,
-					At:           at,
-				})
-				return CycleModeMaxJobsExceeded(runOpts.CycleMode.MaxJobs)
-			}
-
-			reservedJobs++
-			reservationTaken = true
-			frontierMu.Unlock()
-		}
 
 		tasksWG.Add(1)
 		job := Job{
-			Name: fmt.Sprintf("%s_%v", stageName, in),
+			Name: stageName, // Kill per-job fmt.Sprintf in hot path
 			Run: func(_ context.Context) error {
 				defer tasksWG.Done()
+				if frontierEntryID != 0 {
+					defer frontierOutstandingWG.Done()
+				}
 				if runCtx.Err() != nil {
 					return runCtx.Err()
 				}
@@ -635,6 +420,21 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 				}
 
 				if err != nil {
+					if frontierEntryID != 0 {
+						ackErr := fs.Ack(frontierEntryID)
+						if ackErr != nil {
+							return fmt.Errorf("stage %s: %w", stageName, errors.Join(err, fmt.Errorf("frontier ack after stage error: %w", ackErr)))
+						}
+						iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
+							RunID:   runID,
+							EntryID: frontierEntryID,
+							Stage:   stageName,
+							Input:   in,
+							Hops:    hops,
+							Attempt: frontierEntryAttempt,
+							At:      time.Now(),
+						})
+					}
 					return fmt.Errorf("stage %s: %w", stageName, err)
 				}
 
@@ -654,12 +454,26 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 
 				for _, nextStage := range edges[stageName] {
 					for _, item := range out {
-						if err := enqueue(nextStage, item, hops+1); err != nil {
+						if err := enqueueGuarded(nextStage, item, hops+1); err != nil {
 							return fmt.Errorf("enqueue to %s: %w", nextStage, err)
 						}
 					}
 				}
 
+				if frontierEntryID != 0 {
+					if err := fs.Ack(frontierEntryID); err != nil {
+						return fmt.Errorf("frontier ack: %w", err)
+					}
+					iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
+						RunID:   runID,
+						EntryID: frontierEntryID,
+						Stage:   stageName,
+						Input:   in,
+						Hops:    hops,
+						Attempt: frontierEntryAttempt,
+						At:      time.Now(),
+					})
+				}
 				return nil
 			},
 		}
@@ -667,79 +481,91 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 		select {
 		case <-ctx.Done():
 			tasksWG.Done()
-			frontierMu.Lock()
-			if reservationTaken {
-				reservedJobs--
-			}
-			rollbackDedup()
-			frontierMu.Unlock()
 			return ctx.Err()
 
 		case stageJobs <- job:
-			frontierMu.Lock()
-			if reservationTaken {
-				reservedJobs--
-			}
-			acceptedJobs++
-			frontierMu.Unlock()
 			return nil
 		}
 
 	}
 
-	for stageName, inputs := range seeds {
-		for _, input := range inputs {
-			if err := enqueue(stageName, input, 0); err != nil {
-				recordErr(fmt.Errorf("enqueue seed %s: %w", stageName, err))
+	var schedulerWG sync.WaitGroup
+
+	schedulerWG.Go(func() {
+		if !useFrontier {
+			return
+		}
+		dispatchReserved := func(entry frontier.Entry[T]) {
+			iruntime.Call2(runOpts.Hooks.FrontierReserve, runCtx, FrontierReserveEvent[T]{
+				RunID:   runID,
+				EntryID: entry.ID,
+				Stage:   entry.Stage,
+				Input:   entry.Input,
+				Hops:    entry.Hops,
+				Attempt: entry.Attempt,
+				At:      time.Now(),
+			})
+			if err := enqueueDirect(entry.Stage, entry.Input, entry.Hops, entry.ID, entry.Attempt); err != nil {
+				recordErr(fmt.Errorf("frontier dispatch: %w", err))
+				if errors.Is(err, ErrStageNotFound) {
+					if ackErr := fs.Ack(entry.ID); ackErr != nil {
+						recordErr(fmt.Errorf("frontier ack after stage-not-found: %w", ackErr))
+					} else {
+						iruntime.Call2(runOpts.Hooks.FrontierAck, runCtx, FrontierAckEvent[T]{
+							RunID:   runID,
+							EntryID: entry.ID,
+							Stage:   entry.Stage,
+							Input:   entry.Input,
+							Hops:    entry.Hops,
+							Attempt: entry.Attempt,
+							At:      time.Now(),
+						})
+					}
+					frontierOutstandingWG.Done()
+					return
+				}
+				if retryErr := fs.Retry(entry.ID, err); retryErr != nil {
+					if errors.Is(retryErr, frontier.ErrNotFound) {
+						// Entry may already be terminalized by worker path (acked on
+						// non-retriable stage exhaustion/error). Outstanding counter is
+						// decremented there.
+						return
+					}
+					recordErr(fmt.Errorf("frontier retry after dispatch failure: %w", retryErr))
+					frontierOutstandingWG.Done()
+				} else {
+					iruntime.Call2(runOpts.Hooks.FrontierRetry, runCtx, FrontierRetryEvent[T]{
+						RunID:   runID,
+						EntryID: entry.ID,
+						Stage:   entry.Stage,
+						Input:   entry.Input,
+						Hops:    entry.Hops,
+						Attempt: entry.Attempt,
+						Err:     err,
+						At:      time.Now(),
+					})
+				}
 			}
 		}
-	}
 
-	for _, trigger := range runOpts.Triggers {
-		triggersWG.Add(1)
-		go func(trigger Trigger[T]) {
-			defer triggersWG.Done()
-			emit := func(item T) error {
-				if err := enqueue(trigger.Stage(), item, 0); err != nil {
-					return fmt.Errorf("trigger enqueue %s: %w", trigger.Name(), err)
-				}
-				return nil
-			}
-			startTime := time.Now()
-			iruntime.Call2(runOpts.Hooks.TriggerStart, runCtx, TriggerStartEvent[T]{
-				RunID:     runID,
-				Trigger:   trigger.Name(),
-				Stage:     trigger.Stage(),
-				StartedAt: startTime,
-			})
-			err := trigger.Start(ctx, emit)
-			finishTime := time.Now()
-			duration := finishTime.Sub(startTime)
-			if err != nil {
-				iruntime.Call2(runOpts.Hooks.TriggerError, runCtx, TriggerErrorEvent[T]{
-					RunID:      runID,
-					Trigger:    trigger.Name(),
-					Stage:      trigger.Stage(),
-					StartedAt:  startTime,
-					FinishedAt: finishTime,
-					Duration:   duration,
-					Err:        err,
-				})
-				recordErr(fmt.Errorf("trigger %s: %w", trigger.Name(), err))
-				return
-			}
-			iruntime.Call2(runOpts.Hooks.TriggerEnd, runCtx, TriggerEndEvent[T]{
-				RunID:      runID,
-				Trigger:    trigger.Name(),
-				Stage:      trigger.Stage(),
-				StartedAt:  startTime,
-				FinishedAt: finishTime,
-				Duration:   duration,
-			})
-		}(trigger)
-	}
+		iruntime.RunFrontierScheduler(iruntime.FrontierSchedulerConfig[T]{
+			Ctx:          runCtx,
+			BufferSize:   runOpts.BufferSize,
+			Store:        fs,
+			IsContextErr: isContextErr,
+			Dispatch:     dispatchReserved,
+			OnError:      recordErr,
+		})
+	})
+
+	enqueueSeeds(seeds, enqueueGuarded, recordErr)
+	startTriggerWorkers(ctx, runCtx, runID, runOpts, enqueueGuarded, &triggersWG, recordErr)
 
 	triggersWG.Wait()
+	if useFrontier {
+		waitForFrontierOutstanding(runCtx, fs, &frontierOutstandingWG)
+		schedulerWG.Wait()
+	}
 	tasksWG.Wait()
 	for _, jobsCh := range jobsByStage {
 		close(jobsCh)
@@ -823,6 +649,469 @@ func (p *Pipeline[T]) Validate() error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.validateSnapshot(p.stages, p.edges, false)
+}
+
+func (p *Pipeline[T]) validateRunPreflight(
+	ctx context.Context,
+	stages map[string]Stage[T],
+	edges map[string][]string,
+	seeds map[string][]T,
+	runOpts *RunOptions[T],
+) error {
+	if runOpts.CycleMode.Enabled {
+		if runOpts.CycleMode.MaxHops < -1 {
+			return ErrCycleModeInvalidMaxHops
+		}
+		if runOpts.CycleMode.MaxJobs <= 0 {
+			return ErrCycleModeInvalidMaxJobs
+		}
+	}
+
+	if err := p.validateSnapshot(stages, edges, runOpts.CycleMode.Enabled); err != nil {
+		return err
+	}
+
+	for seedStage := range seeds {
+		if _, ok := stages[seedStage]; !ok {
+			return StageNotFound(seedStage)
+		}
+	}
+
+	for _, trigger := range runOpts.Triggers {
+		if _, ok := stages[trigger.Stage()]; !ok {
+			return fmt.Errorf("trigger %s: %w", trigger.Name(), StageNotFound(trigger.Stage()))
+		}
+	}
+
+	for _, sink := range runOpts.Sinks {
+		if _, ok := stages[sink.Stage()]; !ok {
+			return fmt.Errorf("sink %s: %w", sink.Name(), StageNotFound(sink.Stage()))
+		}
+	}
+
+	for stageName, count := range runOpts.StageWorkers {
+		if _, ok := stages[stageName]; !ok {
+			return fmt.Errorf("stage workers config: %w", StageNotFound(stageName))
+		}
+		if count <= 0 {
+			return fmt.Errorf("stage %s: invalid worker count %d: %w", stageName, count, ErrInvalidWorkerCount)
+		}
+	}
+
+	for stageName, rateCfg := range runOpts.StageRateLimits {
+		if _, ok := stages[stageName]; !ok {
+			return fmt.Errorf("stage rate limits config: %w", StageNotFound(stageName))
+		}
+		if rateCfg.RPS <= 0 {
+			return fmt.Errorf("stage %s: invalid RPS %f: %w", stageName, rateCfg.RPS, ErrInvalidRPS)
+		}
+		if rateCfg.Burst < 1 {
+			return fmt.Errorf("stage %s: invalid burst %d: %w", stageName, rateCfg.Burst, ErrInvalidBurst)
+		}
+	}
+
+	for stageName, policy := range runOpts.StagePolicies {
+		if _, ok := stages[stageName]; !ok {
+			return fmt.Errorf("stage policies config: %w", StageNotFound(stageName))
+		}
+		if policy.MaxAttempts < 1 {
+			return fmt.Errorf("invalid stage policy max attempts %d: %w", policy.MaxAttempts, ErrInvalidStagePolicyMaxAttempts)
+		}
+		if policy.Backoff < 0 {
+			return fmt.Errorf("invalid stage policy backoff %s: %w", policy.Backoff, ErrInvalidStagePolicyBackoff)
+		}
+		if policy.Timeout < 0 {
+			return fmt.Errorf("invalid stage policy timeout %s: %w", policy.Timeout, ErrInvalidStagePolicyTimeout)
+		}
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return nil
+}
+
+func buildDedupRulesByStage[T any](rules []DedupRule[T], stages map[string]Stage[T]) (map[string][]DedupRule[T], error) {
+	byStage := make(map[string][]DedupRule[T])
+
+	for _, rule := range rules {
+		if rule.Name == "" {
+			return nil, ErrInvalidDedupRuleName
+		}
+		if rule.Key == nil {
+			return nil, fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleKey)
+		}
+		if rule.Scope == "" {
+			return nil, fmt.Errorf("dedup rule %s: %w", rule.Name, ErrInvalidDedupRuleScope)
+		}
+		stageScope, isStageScope := parseStageScope(rule.Scope)
+		if !isStageScope && rule.Scope != DedupScopeGlobal {
+			return nil, fmt.Errorf("dedup rule %s: invalid scope %s: %w", rule.Name, rule.Scope, ErrInvalidDedupRuleScope)
+		}
+
+		if isStageScope {
+			if _, ok := stages[stageScope]; !ok {
+				return nil, fmt.Errorf("dedup rule %s: %w", rule.Name, StageNotFound(stageScope))
+			}
+			byStage[stageScope] = append(byStage[stageScope], rule)
+		}
+
+		if !isStageScope || rule.Scope == DedupScopeGlobal {
+			for stageName := range stages {
+				byStage[stageName] = append(byStage[stageName], rule)
+			}
+		}
+	}
+
+	return byStage, nil
+}
+
+func toRuntimeDedupRulesByStage[T any](byStage map[string][]DedupRule[T]) map[string][]iruntime.GuardedDedupRule[T] {
+	runtimeRules := make(map[string][]iruntime.GuardedDedupRule[T], len(byStage))
+	for stageName, rules := range byStage {
+		stageRules := make([]iruntime.GuardedDedupRule[T], 0, len(rules))
+		for _, rule := range rules {
+			stageRules = append(stageRules, iruntime.GuardedDedupRule[T]{
+				Name:  rule.Name,
+				Scope: string(rule.Scope),
+				Key:   rule.Key,
+			})
+		}
+		runtimeRules[stageName] = stageRules
+	}
+	return runtimeRules
+}
+
+func buildStageLimiters(stageRateLimits map[string]RateLimit) map[string]*rate.Limiter {
+	limiters := map[string]*rate.Limiter{}
+	for stageName, cfg := range stageRateLimits {
+		limiters[stageName] = rate.NewLimiter(rate.Limit(cfg.RPS), cfg.Burst)
+	}
+	return limiters
+}
+
+func createPoolsByStage[T any](stages map[string]Stage[T], runOpts *RunOptions[T]) (map[string]*Pool, error) {
+	// Snapshot stage worker configuration and ensure all pools can be created
+	// before starting any worker goroutine. This avoids partial startup leaks
+	// if one stage has an invalid worker count at run time.
+	poolsByStage := make(map[string]*Pool, len(stages))
+	for stageName, stage := range stages {
+		pool, err := NewPool(PoolConfig{
+			Workers: func() int {
+				if count, ok := runOpts.StageWorkers[stageName]; ok {
+					return count
+				}
+				return stage.Workers()
+			}(),
+			Queue:         runOpts.BufferSize,
+			DrainOnCancel: true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: failed to create worker pool: %w", stageName, err)
+		}
+		poolsByStage[stageName] = pool
+	}
+	return poolsByStage, nil
+}
+
+func startSinkWorkers[T any](
+	ctx context.Context,
+	runCtx context.Context,
+	runID string,
+	runOpts *RunOptions[T],
+	sinksByStage map[string][]chan T,
+	sinksWG *sync.WaitGroup,
+	recordErr func(error),
+) {
+	for _, sink := range runOpts.Sinks {
+		sinkCh := make(chan T, runOpts.BufferSize)
+		sinksByStage[sink.Stage()] = append(sinksByStage[sink.Stage()], sinkCh)
+
+		sinksWG.Add(1)
+		go func(sink Sink[T], sinkCh chan T) {
+			defer sinksWG.Done()
+			disabled := false
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item, ok := <-sinkCh:
+					if !ok {
+						return
+					}
+					if disabled {
+						continue
+					}
+
+					attempts := 0
+					for {
+						startTime := time.Now()
+						iruntime.Call2(runOpts.Hooks.SinkConsumeStart, runCtx, SinkConsumeStartEvent[T]{
+							RunID:     runID,
+							Sink:      sink.Name(),
+							Stage:     sink.Stage(),
+							Item:      item,
+							Attempt:   attempts + 1,
+							StartedAt: startTime,
+						})
+						err := sink.Consume(ctx, item)
+						finishTime := time.Now()
+						duration := finishTime.Sub(startTime)
+
+						if err == nil {
+							iruntime.Call2(runOpts.Hooks.SinkConsumeSuccess, runCtx, SinkConsumeSuccessEvent[T]{
+								RunID:      runID,
+								Sink:       sink.Name(),
+								Stage:      sink.Stage(),
+								Item:       item,
+								Attempt:    attempts + 1,
+								StartedAt:  startTime,
+								FinishedAt: finishTime,
+								Duration:   duration,
+							})
+							break
+						}
+						attempts++
+
+						if runOpts.SinkRetry.MaxRetries >= 0 && attempts > runOpts.SinkRetry.MaxRetries {
+							iruntime.Call2(runOpts.Hooks.SinkExhausted, runCtx, SinkExhaustedEvent[T]{
+								RunID:    runID,
+								Sink:     sink.Name(),
+								Stage:    sink.Stage(),
+								Item:     item,
+								Err:      err,
+								Attempts: attempts,
+								At:       time.Now(),
+							})
+							recordErr(fmt.Errorf("sink %s: retries exhausted: %w", sink.Name(), err))
+							disabled = true
+							break
+						}
+
+						if ctx.Err() != nil {
+							recordErr(fmt.Errorf("sink %s: %w", sink.Name(), err))
+							return
+						}
+
+						iruntime.Call2(runOpts.Hooks.SinkRetry, runCtx, SinkRetryEvent[T]{
+							RunID:   runID,
+							Sink:    sink.Name(),
+							Stage:   sink.Stage(),
+							Item:    item,
+							Attempt: attempts,
+							Err:     err,
+							Backoff: runOpts.SinkRetry.Backoff,
+							At:      time.Now(),
+						})
+
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(runOpts.SinkRetry.Backoff):
+						}
+					}
+				}
+			}
+		}(sink, sinkCh)
+	}
+}
+
+func startStagePools[T any](
+	runCtx context.Context,
+	stages map[string]Stage[T],
+	runOpts *RunOptions[T],
+	poolsByStage map[string]*Pool,
+	jobsByStage map[string]chan Job,
+	poolErrWG *sync.WaitGroup,
+	recordErr func(error),
+) {
+	for stageName := range stages {
+		stageJobs := make(chan Job, runOpts.BufferSize)
+		jobsByStage[stageName] = stageJobs
+
+		pool := poolsByStage[stageName]
+
+		poolErrWG.Add(1)
+		// Stage pools drain queued jobs after cancellation so tasksWG can reach zero.
+		poolErrCh := pool.Run(runCtx, stageJobs)
+		go func(poolErrCh <-chan error) {
+			defer poolErrWG.Done()
+			for err := range poolErrCh {
+				recordErr(err)
+			}
+		}(poolErrCh)
+	}
+}
+
+func enqueueSeeds[T any](
+	seeds map[string][]T,
+	enqueueGuarded func(stageName string, in T, hops int) error,
+	recordErr func(error),
+) {
+	for stageName, inputs := range seeds {
+		for _, input := range inputs {
+			if err := enqueueGuarded(stageName, input, 0); err != nil {
+				recordErr(fmt.Errorf("enqueue seed %s: %w", stageName, err))
+			}
+		}
+	}
+}
+
+func startTriggerWorkers[T any](
+	ctx context.Context,
+	runCtx context.Context,
+	runID string,
+	runOpts *RunOptions[T],
+	enqueueGuarded func(stageName string, in T, hops int) error,
+	triggersWG *sync.WaitGroup,
+	recordErr func(error),
+) {
+	for _, trigger := range runOpts.Triggers {
+		triggersWG.Add(1)
+		go func(trigger Trigger[T]) {
+			defer triggersWG.Done()
+			emit := func(item T) error {
+				if err := enqueueGuarded(trigger.Stage(), item, 0); err != nil {
+					return fmt.Errorf("trigger enqueue %s: %w", trigger.Name(), err)
+				}
+				return nil
+			}
+			startTime := time.Now()
+			iruntime.Call2(runOpts.Hooks.TriggerStart, runCtx, TriggerStartEvent[T]{
+				RunID:     runID,
+				Trigger:   trigger.Name(),
+				Stage:     trigger.Stage(),
+				StartedAt: startTime,
+			})
+			err := trigger.Start(ctx, emit)
+			finishTime := time.Now()
+			duration := finishTime.Sub(startTime)
+			if err != nil {
+				iruntime.Call2(runOpts.Hooks.TriggerError, runCtx, TriggerErrorEvent[T]{
+					RunID:      runID,
+					Trigger:    trigger.Name(),
+					Stage:      trigger.Stage(),
+					StartedAt:  startTime,
+					FinishedAt: finishTime,
+					Duration:   duration,
+					Err:        err,
+				})
+				recordErr(fmt.Errorf("trigger %s: %w", trigger.Name(), err))
+				return
+			}
+			iruntime.Call2(runOpts.Hooks.TriggerEnd, runCtx, TriggerEndEvent[T]{
+				RunID:      runID,
+				Trigger:    trigger.Name(),
+				Stage:      trigger.Stage(),
+				StartedAt:  startTime,
+				FinishedAt: finishTime,
+				Duration:   duration,
+			})
+		}(trigger)
+	}
+}
+
+func waitForFrontierOutstanding[T any](runCtx context.Context, fs frontier.Store[T], frontierOutstandingWG *sync.WaitGroup) {
+	waitDone := make(chan struct{})
+	go func() {
+		frontierOutstandingWG.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-runCtx.Done():
+	}
+	_ = fs.Close()
+	if drainer, ok := fs.(interface{ DrainPending() int }); ok {
+		for i := 0; i < drainer.DrainPending(); i++ {
+			frontierOutstandingWG.Done()
+		}
+	}
+}
+
+func setupFrontierRuntime[T any](
+	runCtx context.Context,
+	runID string,
+	runOpts *RunOptions[T],
+	stageCount int,
+	frontierStatsWG *sync.WaitGroup,
+	stopFrontierStats *func(),
+	recordErr func(error),
+) (frontier.Store[T], bool, error) {
+	if !runOpts.UseFrontier {
+		return nil, false, nil
+	}
+
+	var (
+		fs          frontier.Store[T]
+		closeOnExit bool
+	)
+	if runOpts.FrontierStore != nil {
+		fs = runOpts.FrontierStore
+	} else {
+		frontierCap := runOpts.FrontierPendingCap
+		if frontierCap <= 0 {
+			frontierCap = max(1024, runOpts.BufferSize*stageCount)
+		}
+		fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
+		closeOnExit = true
+	}
+
+	if dfs, ok := fs.(frontier.DurableFrontierStore[T]); ok {
+		const requeueLimit = 4096 // or run option
+		if n, err := dfs.RequeueExpired(runCtx, time.Now(), requeueLimit); err != nil {
+			recordErr(fmt.Errorf("frontier requeue expired: %w", err))
+			if runOpts.FailFast {
+				return nil, closeOnExit, err
+			}
+		} else if n > 0 {
+			iruntime.Call2(runOpts.Hooks.FrontierRequeueExpired, runCtx, FrontierRequeueExpiredEvent{
+				RunID: runID,
+				Count: n,
+				At:    time.Now(),
+			})
+		}
+	}
+
+	if runOpts.FrontierStatsInterval > 0 {
+		if statsProvider, ok := fs.(frontier.StatsProvider); ok {
+			statsCtx, statsCancel := context.WithCancel(runCtx)
+			*stopFrontierStats = statsCancel
+			frontierStatsWG.Go(func() {
+				emit := func() {
+					stats := statsProvider.Stats()
+					iruntime.Call2(runOpts.Hooks.FrontierStats, runCtx, FrontierStatsEvent{
+						RunID:             runID,
+						Pending:           stats.Pending,
+						Inflight:          stats.Inflight,
+						Acked:             stats.Acked,
+						Retried:           stats.Retried,
+						Dropped:           stats.Dropped,
+						TerminalFailed:    stats.TerminalFailed,
+						Canceled:          stats.Canceled,
+						EnqueueFull:       stats.EnqueueFull,
+						PendingQueueDepth: stats.PendingQueueDepth,
+						At:                time.Now(),
+					})
+				}
+
+				emit()
+				ticker := time.NewTicker(runOpts.FrontierStatsInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-statsCtx.Done():
+						return
+					case <-ticker.C:
+						emit()
+					}
+				}
+			})
+		}
+	}
+
+	return fs, closeOnExit, nil
 }
 
 func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string, allowCycles bool) error {

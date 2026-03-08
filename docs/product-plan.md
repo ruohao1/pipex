@@ -2,11 +2,20 @@
 
 This document tracks feature planning, milestones, and active TODOs for `pipex`.
 
+## Direction Lock (Current)
+
+- Primary audience: builders of security automation/scanner workflows.
+- Product boundary: `pipex` remains a domain-neutral execution engine.
+- Application boundary: `penta` (https://github.com/ruohao1/penta) owns scanner-specific semantics and UX.
+- Strategic priority: recoverable and resumable runtime primitives.
+- Explicit non-goal: adding scanner-specific concepts to `pipex` public API.
+- Delivery rule for this phase: favor clarity, boundary enforcement, and runtime hardening over feature breadth.
+
 ## Planning Goals
 
-- Keep `pipex` simple for DAG-first workflows.
-- Support scanner/crawler-style recursive workloads behind explicit opt-in controls.
-- Evolve runtime safety and observability without breaking default semantics.
+- Position `pipex` as a recoverable workflow runtime for security automation.
+- Keep an ephemeral direct-dispatch mode for low-overhead local execution and benchmarks.
+- Evolve runtime safety, retry behavior, and observability without breaking API ergonomics.
 
 ## Current Status
 
@@ -16,7 +25,9 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 - Stage/global dedup rules are available via `WithDedupRules(...)`.
 - Stage rate limiting is available via `WithStageRateLimits(...)`.
 - Stage retry/timeout policies are available via `WithStagePolicies(...)`.
-- Cycle dedup key in `WithCycleMode(...)` is on a deprecation path in favor of `WithDedupRules(...)`.
+- Frontier-backed runtime mode is available via `WithFrontier(true)`.
+- Ephemeral direct-dispatch mode is available via `WithFrontier(false)`.
+- Cycle dedup surface has been removed in favor of `WithDedupRules(...)`.
 
 ## Milestones
 
@@ -46,11 +57,24 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 
 ## `v1.0.0` breaking cleanup
 
-- [ ] Remove cycle dedup surface (`CycleModeOptions.DedupKey`).
-- [ ] Change `WithCycleMode(maxHops, maxJobs, dedupKey)` to `WithCycleMode(maxHops, maxJobs)`.
-- [ ] Remove cycle dedup compatibility shim from runtime.
-- [ ] Remove `CycleDedupDrop` hook and standardize dedup drop reporting.
-- [ ] Publish migration notes with before/after snippets.
+- [x] Remove cycle dedup surface (`CycleModeOptions.DedupKey`).
+- [x] Change `WithCycleMode(maxHops, maxJobs, dedupKey)` to `WithCycleMode(maxHops, maxJobs)`.
+- [x] Remove cycle dedup compatibility shim from runtime.
+- [x] Remove `CycleDedupDrop` hook and standardize dedup drop reporting.
+- [x] Publish migration notes with before/after snippets.
+
+## `v1.1.x` frontier hardening (active)
+
+- [x] Ensure stage exhaustion is terminal in frontier mode (no unbounded requeue).
+- [x] Make memory frontier enqueue/close behavior deterministic.
+- [x] Preserve inflight entries on retry backpressure (`ErrPendingQueueFull`).
+- [x] Add parity and frontier-focused benchmark coverage.
+- [x] Define explicit frontier execution-state model (`pending`, `reserved`, `acked`, `retried`, `terminal_failed`, `dropped`, `canceled`).
+- [ ] Add terminal failure recording/reporting path (beyond ack/retry only).
+- [x] Add sampled frontier runtime stats surface (queue depth, inflight, retries, enqueue pressure) via `WithFrontierStatsInterval(...)` + `FrontierStats` hook.
+- [ ] Add per-stage backlog metrics (remaining runtime metrics gap).
+- [x] Reduce frontier hot-path allocations by reusing reserve batch buffers and removing per-job string formatting in enqueue path.
+- [ ] Stabilize blocking enqueue mode under retry-heavy contention and re-enable it in all benchmark scenarios.
 
 ## Feature Tracks
 
@@ -62,9 +86,11 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 - Add stage-level retry policy and per-item timeout controls.
 - Keep behavior opt-in and backward-compatible.
 
-3. Frontier and Resume
-- Define in-memory frontier abstraction for resume/retry semantics.
-- Evaluate persistent frontier backends after API stabilizes.
+3. Frontier Runtime (Primary)
+- Keep frontier-backed execution as the canonical runtime path for security workflows.
+- Preserve `WithFrontier(false)` as an ephemeral fast mode and performance baseline.
+- Harden frontier semantics and observability before introducing persistent backends.
+- Evaluate persistent frontier backends after execution-state API stabilizes.
 
 4. Scanner/Crawler Patterns
 - Document per-host limiter patterns inside stage processing.
@@ -75,6 +101,8 @@ This document tracks feature planning, milestones, and active TODOs for `pipex`.
 - [x] Link the v1 breaking-change issue number in this doc (issue: `#1`).
 - [x] Add `docs/migration-v1.md` draft before v1 API freeze.
 - [x] Keep release notes synchronized with completed milestone checkboxes.
+- [ ] Publish a runtime-mode guide comparing recoverable (frontier) and ephemeral modes.
+- [ ] Add dedicated microbenchmarks isolating frontier store vs scheduler vs hooks costs.
 
 ## Working Agreement
 

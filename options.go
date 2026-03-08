@@ -3,11 +3,19 @@ package pipex
 import (
 	"maps"
 	"time"
+
+	"github.com/ruohao1/pipex/internal/frontier"
 )
 
 type RunOptions[T any] struct {
-	BufferSize           int
-	FailFast             bool
+	BufferSize              int
+	FailFast                bool
+	UseFrontier             bool
+	FrontierPendingCap      int
+	FrontierBlockingEnqueue bool
+	FrontierStatsInterval   time.Duration
+	FrontierStore           frontier.Store[T]
+
 	Triggers             []Trigger[T]
 	Sinks                []Sink[T]
 	Hooks                Hooks[T]
@@ -63,11 +71,15 @@ type Option[T any] func(*RunOptions[T])
 
 func defaultOptions[T any]() *RunOptions[T] {
 	return &RunOptions[T]{
-		BufferSize: 1024,
-		FailFast:   false,
-		Triggers:   []Trigger[T]{},
-		Sinks:      []Sink[T]{},
-		Hooks:      Hooks[T]{},
+		BufferSize:              1024,
+		FailFast:                false,
+		UseFrontier:             false,
+		FrontierPendingCap:      0,
+		FrontierBlockingEnqueue: false,
+		FrontierStatsInterval:   0,
+		Triggers:                []Trigger[T]{},
+		Sinks:                   []Sink[T]{},
+		Hooks:                   Hooks[T]{},
 		CycleMode: CycleModeOptions[T]{
 			Enabled: false,
 			MaxHops: -1,
@@ -97,6 +109,48 @@ func WithBufferSize[T any](size int) Option[T] {
 func WithFailFast[T any](failFast bool) Option[T] {
 	return func(opts *RunOptions[T]) {
 		opts.FailFast = failFast
+	}
+}
+
+func WithFrontier[T any](enabled bool) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.UseFrontier = enabled
+	}
+}
+
+// WithFrontierPendingCapacity sets in-memory frontier pending queue capacity.
+// Values <= 0 are ignored and keep automatic sizing.
+func WithFrontierPendingCapacity[T any](n int) Option[T] {
+	return func(opts *RunOptions[T]) {
+		if n <= 0 {
+			return
+		}
+		opts.FrontierPendingCap = n
+	}
+}
+
+// WithFrontierBlockingEnqueue enables blocking, context-aware enqueue in frontier mode.
+func WithFrontierBlockingEnqueue[T any](enabled bool) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.FrontierBlockingEnqueue = enabled
+	}
+}
+
+// WithFrontierStatsInterval configures sampled frontier stats emission interval.
+// Values <= 0 disable sampled frontier stats.
+func WithFrontierStatsInterval[T any](interval time.Duration) Option[T] {
+	return func(opts *RunOptions[T]) {
+		if interval <= 0 {
+			opts.FrontierStatsInterval = 0
+			return
+		}
+		opts.FrontierStatsInterval = interval
+	}
+}
+
+func WithFrontierStore[T any](store frontier.Store[T]) Option[T] {
+	return func(opts *RunOptions[T]) {
+		opts.FrontierStore = store
 	}
 }
 
