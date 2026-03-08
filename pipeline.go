@@ -287,33 +287,7 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			if runOpts.FrontierBlockingEnqueue && hasBlockingEnqueuer {
 				entryID, err = blockingEnqueuer.EnqueueWait(runCtx, stageName, in, hops)
 			} else {
-				var backoffTicker *time.Ticker
-				stopBackoffTicker := func() {
-					if backoffTicker != nil {
-						backoffTicker.Stop()
-					}
-				}
-				defer stopBackoffTicker()
-				for {
-					entryID, err = fs.Enqueue(stageName, in, hops)
-					if err == nil {
-						break
-					}
-					if !errors.Is(err, frontier.ErrPendingQueueFull) {
-						break
-					}
-					if backoffTicker == nil {
-						backoffTicker = time.NewTicker(250 * time.Microsecond)
-					}
-					select {
-					case <-runCtx.Done():
-						err = runCtx.Err()
-					case <-backoffTicker.C:
-					}
-					if err != nil {
-						break
-					}
-				}
+				entryID, err = iruntime.EnqueueWithBackpressure(runCtx, fs, stageName, in, hops)
 			}
 			if err == nil {
 				frontierOutstandingWG.Add(1)
