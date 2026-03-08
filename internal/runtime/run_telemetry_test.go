@@ -74,3 +74,66 @@ func TestRunTelemetryByID_CurrentlyPausedFields(t *testing.T) {
 		t.Fatalf("last state=%s want=%s", tm.LastState, RunStatePaused)
 	}
 }
+
+func TestRunTelemetrySnapshot_AllRuns(t *testing.T) {
+	running := NewRunHandle("snap-running", nil)
+	paused := NewRunHandle("snap-paused", nil)
+	completed := NewRunHandle("snap-completed", nil)
+	RegisterRunHandle("snap-running", running)
+	RegisterRunHandle("snap-paused", paused)
+	RegisterRunHandle("snap-completed", completed)
+	defer UnregisterRunHandle("snap-running")
+	defer UnregisterRunHandle("snap-paused")
+	defer UnregisterRunHandle("snap-completed")
+
+	if !paused.Pause() {
+		t.Fatal("pause should succeed")
+	}
+	if !completed.MarkCompleted() {
+		t.Fatal("mark completed should succeed")
+	}
+
+	snap := RunTelemetrySnapshot(false)
+	if len(snap) != 3 {
+		t.Fatalf("snapshot size=%d want=3", len(snap))
+	}
+	if snap["snap-running"].LastState != RunStateRunning {
+		t.Fatalf("running state=%s want=%s", snap["snap-running"].LastState, RunStateRunning)
+	}
+	if snap["snap-paused"].LastState != RunStatePaused {
+		t.Fatalf("paused state=%s want=%s", snap["snap-paused"].LastState, RunStatePaused)
+	}
+	if snap["snap-completed"].LastState != RunStateCompleted {
+		t.Fatalf("completed state=%s want=%s", snap["snap-completed"].LastState, RunStateCompleted)
+	}
+}
+
+func TestRunTelemetrySnapshot_ActiveOnly(t *testing.T) {
+	running := NewRunHandle("active-running", nil)
+	paused := NewRunHandle("active-paused", nil)
+	canceled := NewRunHandle("active-canceled", nil)
+	RegisterRunHandle("active-running", running)
+	RegisterRunHandle("active-paused", paused)
+	RegisterRunHandle("active-canceled", canceled)
+	defer UnregisterRunHandle("active-running")
+	defer UnregisterRunHandle("active-paused")
+	defer UnregisterRunHandle("active-canceled")
+
+	if !paused.Pause() {
+		t.Fatal("pause should succeed")
+	}
+	if !canceled.Cancel() {
+		t.Fatal("cancel should succeed")
+	}
+
+	snap := RunTelemetrySnapshot(true)
+	if _, ok := snap["active-canceled"]; ok {
+		t.Fatal("expected canceled run to be excluded for activeOnly")
+	}
+	if _, ok := snap["active-running"]; !ok {
+		t.Fatal("expected running run in activeOnly snapshot")
+	}
+	if _, ok := snap["active-paused"]; !ok {
+		t.Fatal("expected paused run in activeOnly snapshot")
+	}
+}

@@ -18,6 +18,33 @@ func RunTelemetryByID(runID string) (RunTelemetry, bool) {
 	if !ok {
 		return RunTelemetry{}, false
 	}
+	return runStatusToTelemetry(st), true
+}
+
+// RunTelemetrySnapshot returns a copy of run telemetry keyed by run_id.
+// When activeOnly is true, terminal runs (completed/canceled) are excluded.
+func RunTelemetrySnapshot(activeOnly bool) map[string]RunTelemetry {
+	out := make(map[string]RunTelemetry)
+	runHandleRegistry.Range(func(key, value any) bool {
+		runID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		h, ok := value.(*RunHandle)
+		if !ok {
+			return true
+		}
+		st := h.Status()
+		if activeOnly && isTerminalRunState(st.State) {
+			return true
+		}
+		out[runID] = runStatusToTelemetry(st)
+		return true
+	})
+	return out
+}
+
+func runStatusToTelemetry(st RunStatus) RunTelemetry {
 	return RunTelemetry{
 		RunID:             st.RunID,
 		PauseCount:        st.PauseCount,
@@ -27,5 +54,9 @@ func RunTelemetryByID(runID string) (RunTelemetry, bool) {
 		CurrentPauseStart: st.CurrentPauseStart,
 		LastState:         st.State,
 		UpdatedAt:         st.UpdatedAt,
-	}, true
+	}
+}
+
+func isTerminalRunState(state RunState) bool {
+	return state == RunStateCanceled || state == RunStateCompleted
 }
