@@ -12,6 +12,7 @@ var (
 	ErrStageNotFound  = errors.New("stage not found")
 	ErrStageExists    = errors.New("stage already exists")
 	ErrStageConflict  = errors.New("stage definition conflict")
+	ErrRunNotFound    = errors.New("run not found")
 
 	ErrStageInvalidWorkerCount = func(name string, count int) error {
 		return fmt.Errorf("invalid worker count for stage %s: %d", name, count)

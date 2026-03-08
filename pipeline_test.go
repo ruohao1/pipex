@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/ruohao1/pipex/internal/frontier"
-	iruntime "github.com/ruohao1/pipex/internal/runtime"
 )
 
 type testStage[T any] struct {
@@ -2079,7 +2078,7 @@ func TestRunFrontierPauseResumeGatesSchedulerDispatch(t *testing.T) {
 			WithHooks[int](Hooks[int]{
 				RunStart: func(ctx context.Context, meta RunMeta) {
 					rid.Store(meta.RunID)
-					_ = iruntime.PauseRun(meta.RunID)
+					_ = PauseRun(meta.RunID)
 				},
 			}),
 		)
@@ -2104,8 +2103,40 @@ func TestRunFrontierPauseResumeGatesSchedulerDispatch(t *testing.T) {
 		t.Fatalf("expected no processing while paused, got %d", got)
 	}
 
-	if !iruntime.ResumeRun(runID) {
+	telemetry, ok := GetRunTelemetry(runID)
+	if !ok {
+		t.Fatal("expected telemetry for active run")
+	}
+	if telemetry.PauseCount != 1 || telemetry.ResumeCount != 0 {
+		t.Fatalf("unexpected pause/resume counts while paused: %+v", telemetry)
+	}
+	if !telemetry.CurrentlyPaused {
+		t.Fatal("expected currently paused telemetry state")
+	}
+
+	if !ResumeRun(runID) {
 		t.Fatal("expected resume to succeed")
+	}
+
+	deadline = time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		telemetry, ok = GetRunTelemetry(runID)
+		if ok && telemetry.ResumeCount >= 1 && telemetry.LastState == RunStateRunning && !telemetry.CurrentlyPaused {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	if !ok {
+		t.Fatal("expected telemetry after resume before run exit")
+	}
+	if telemetry.ResumeCount < 1 {
+		t.Fatalf("expected resume count to increment, got %d", telemetry.ResumeCount)
+	}
+	if telemetry.LastState != RunStateRunning {
+		t.Fatalf("expected running state after resume, got %s", telemetry.LastState)
+	}
+	if telemetry.CurrentlyPaused {
+		t.Fatal("expected currently paused=false after resume")
 	}
 
 	select {
@@ -2144,7 +2175,7 @@ func TestRunFrontierPauseResumeIdempotentDuringRun(t *testing.T) {
 			WithHooks[int](Hooks[int]{
 				RunStart: func(ctx context.Context, meta RunMeta) {
 					rid.Store(meta.RunID)
-					_ = iruntime.PauseRun(meta.RunID)
+					_ = PauseRun(meta.RunID)
 				},
 			}),
 		)
@@ -2165,14 +2196,14 @@ func TestRunFrontierPauseResumeIdempotentDuringRun(t *testing.T) {
 	}
 
 	// Already paused in RunStart; repeated pause is idempotent.
-	if iruntime.PauseRun(runID) {
+	if PauseRun(runID) {
 		t.Fatal("expected repeated pause to be idempotent no-op")
 	}
 	time.Sleep(20 * time.Millisecond)
-	if !iruntime.ResumeRun(runID) {
+	if !ResumeRun(runID) {
 		t.Fatal("expected first resume to succeed")
 	}
-	if iruntime.ResumeRun(runID) {
+	if ResumeRun(runID) {
 		t.Fatal("expected second resume to be idempotent no-op")
 	}
 
@@ -2233,10 +2264,10 @@ func TestRunFrontierCancelByRunIDIsIdempotent(t *testing.T) {
 		t.Fatal("empty run id")
 	}
 
-	if !iruntime.CancelRun(runID) {
+	if !CancelRun(runID) {
 		t.Fatal("expected first cancel to succeed")
 	}
-	if iruntime.CancelRun(runID) {
+	if CancelRun(runID) {
 		t.Fatal("expected second cancel to be idempotent no-op")
 	}
 
