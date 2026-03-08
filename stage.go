@@ -9,11 +9,10 @@ type Stage[T any] interface {
 	Workers() int
 
 	// Process processes one input item and emits zero or more output items.
-  //
-  // Routing is handled by the pipeline graph (Connect edges), not by the stage.
-  // Each emitted item is forwarded to all configured downstream stages.
-  // Returning an error marks this item as failed and lets the pipeline apply
-  // its configured error policy (for example, fail-fast or continue).
+	//
+	// Routing is handled by the pipeline graph (Connect edges), not by the stage.
+	// Each emitted item is forwarded to all configured downstream stages.
+	// Returning an error marks this item as failed and lets the pipeline apply
+	// its configured error policy (for example, fail-fast or continue).
 	Process(ctx context.Context, in T) (outs []T, err error)
 }
-

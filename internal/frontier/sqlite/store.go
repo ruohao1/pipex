@@ -357,3 +357,31 @@ func (s *DurableStore[T]) RequeueExpired(ctx context.Context, now time.Time, lim
 	}
 	return updated, nil
 }
+
+func (s *DurableStore[T]) StatusSnapshot(ctx context.Context) (frontier.DurableStatusSnapshot, error) {
+	if err := s.ensureSchema(); err != nil {
+		return frontier.DurableStatusSnapshot{}, err
+	}
+
+	row := s.db.QueryRowContext(ctx, `
+	SELECT
+		COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+		COALESCE(SUM(CASE WHEN state = 'reserved' THEN 1 ELSE 0 END), 0) AS reserved,
+		COALESCE(SUM(CASE WHEN state = 'acked' THEN 1 ELSE 0 END), 0) AS acked,
+		COALESCE(SUM(CASE WHEN state = 'terminal_failed' THEN 1 ELSE 0 END), 0) AS terminal_failed,
+		COALESCE(SUM(CASE WHEN state = 'dropped' THEN 1 ELSE 0 END), 0) AS dropped,
+		COALESCE(SUM(CASE WHEN state = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled,
+		COALESCE(SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END), 0) AS retried_entries,
+		COUNT(*) AS total
+	FROM frontier;
+	`)
+	var snap frontier.DurableStatusSnapshot
+	if err := row.Scan(
+		&snap.Pending, &snap.Reserved, &snap.Acked, &snap.TerminalFailed,
+		&snap.Dropped, &snap.Canceled, &snap.RetriedEntries, &snap.Total,
+	); err != nil {
+		return frontier.DurableStatusSnapshot{}, fmt.Errorf("%w: %w", ErrDatabase, err)
+	}
+	snap.At = s.now()
+	return snap, nil
+}

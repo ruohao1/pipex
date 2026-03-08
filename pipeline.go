@@ -1027,8 +1027,7 @@ func setupFrontierRuntime[T any](
 	}
 
 	if dfs, ok := fs.(frontier.DurableFrontierStore[T]); ok {
-		const requeueLimit = 4096 // or run option
-		if n, err := dfs.RequeueExpired(runCtx, time.Now(), requeueLimit); err != nil {
+		if n, err := dfs.RequeueExpired(runCtx, time.Now(), frontier.DefaultRequeueExpiredLimit); err != nil {
 			recordErr(fmt.Errorf("frontier requeue expired: %w", err))
 			if runOpts.FailFast {
 				return nil, closeOnExit, err
@@ -1049,6 +1048,44 @@ func setupFrontierRuntime[T any](
 			frontierStatsWG.Go(func() {
 				emit := func() {
 					stats := statsProvider.Stats()
+					iruntime.Call2(runOpts.Hooks.FrontierStats, runCtx, FrontierStatsEvent{
+						RunID:             runID,
+						Pending:           stats.Pending,
+						Inflight:          stats.Inflight,
+						Acked:             stats.Acked,
+						Retried:           stats.Retried,
+						Dropped:           stats.Dropped,
+						TerminalFailed:    stats.TerminalFailed,
+						Canceled:          stats.Canceled,
+						EnqueueFull:       stats.EnqueueFull,
+						PendingQueueDepth: stats.PendingQueueDepth,
+						At:                time.Now(),
+					})
+				}
+
+				emit()
+				ticker := time.NewTicker(runOpts.FrontierStatsInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-statsCtx.Done():
+						return
+					case <-ticker.C:
+						emit()
+					}
+				}
+			})
+		} else if _, ok, _ := iruntime.TryDurableStatusSnapshot(runCtx, fs); ok {
+			statsCtx, statsCancel := context.WithCancel(runCtx)
+			*stopFrontierStats = statsCancel
+			frontierStatsWG.Go(func() {
+				emit := func() {
+					snap, _, err := iruntime.TryDurableStatusSnapshot(runCtx, fs)
+					if err != nil {
+						recordErr(fmt.Errorf("frontier durable status snapshot: %w", err))
+						return
+					}
+					stats := iruntime.DurableSnapshotToStats(snap)
 					iruntime.Call2(runOpts.Hooks.FrontierStats, runCtx, FrontierStatsEvent{
 						RunID:             runID,
 						Pending:           stats.Pending,

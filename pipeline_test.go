@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ruohao1/pipex/internal/frontier"
 )
 
 type testStage[T any] struct {
@@ -1939,4 +1941,157 @@ func TestRunFrontierStatsHookSampled(t *testing.T) {
 	if samples.Load() == 0 {
 		t.Fatal("expected at least one frontier stats sample")
 	}
+}
+
+func TestRunFrontierStatsHook_DurableProviderPresentEmits(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			time.Sleep(2 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+
+	store := &durableStatusTestStore{
+		base: frontier.NewMemoryStoreWithCapacity[int](64),
+		snapshot: frontier.DurableStatusSnapshot{
+			Pending: 11, Reserved: 3, Acked: 7, RetriedEntries: 2, TerminalFailed: 1,
+		},
+	}
+
+	var (
+		samples  atomic.Int64
+		lastSeen atomic.Int64
+	)
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1, 2}},
+		WithFrontier[int](true),
+		WithFrontierStore[int](store),
+		WithFrontierStatsInterval[int](1*time.Millisecond),
+		WithHooks[int](Hooks[int]{
+			FrontierStats: func(ctx context.Context, e FrontierStatsEvent) {
+				samples.Add(1)
+				lastSeen.Store(e.Pending)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if samples.Load() == 0 {
+		t.Fatal("expected at least one frontier stats sample")
+	}
+	if lastSeen.Load() != 11 {
+		t.Fatalf("expected durable pending mapped to hook, got %d", lastSeen.Load())
+	}
+}
+
+func TestRunFrontierStatsHook_DurableProviderAbsentNoop(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			time.Sleep(2 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+
+	store := &plainStoreNoStatsProvider{
+		base: frontier.NewMemoryStoreWithCapacity[int](64),
+	}
+
+	var samples atomic.Int64
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithFrontier[int](true),
+		WithFrontierStore[int](store),
+		WithFrontierStatsInterval[int](1*time.Millisecond),
+		WithHooks[int](Hooks[int]{
+			FrontierStats: func(ctx context.Context, e FrontierStatsEvent) {
+				samples.Add(1)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+	if samples.Load() != 0 {
+		t.Fatalf("expected no stats samples without providers, got %d", samples.Load())
+	}
+}
+
+func TestRunFrontierStatsHook_DurableProviderErrorRecorded(t *testing.T) {
+	p := NewPipeline[int]()
+	_ = p.AddStage(testStage[int]{
+		name:    "a",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			time.Sleep(2 * time.Millisecond)
+			return []int{in}, nil
+		},
+	})
+
+	store := &durableStatusTestStore{
+		base: frontier.NewMemoryStoreWithCapacity[int](64),
+		err:  errors.New("snapshot failed"),
+	}
+
+	_, err := p.Run(
+		context.Background(),
+		map[string][]int{"a": {1}},
+		WithFrontier[int](true),
+		WithFrontierStore[int](store),
+		WithFrontierStatsInterval[int](1*time.Millisecond),
+	)
+	if err == nil {
+		t.Fatal("expected run error from durable status provider failure")
+	}
+	if !strings.Contains(err.Error(), "frontier durable status snapshot") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+type plainStoreNoStatsProvider struct {
+	base frontier.Store[int]
+}
+
+func (s *plainStoreNoStatsProvider) Enqueue(stage string, item int, hops int) (uint64, error) {
+	return s.base.Enqueue(stage, item, hops)
+}
+func (s *plainStoreNoStatsProvider) Reserve(ctx context.Context) (frontier.Entry[int], bool, error) {
+	return s.base.Reserve(ctx)
+}
+func (s *plainStoreNoStatsProvider) Ack(id uint64) error { return s.base.Ack(id) }
+func (s *plainStoreNoStatsProvider) Retry(id uint64, cause error) error {
+	return s.base.Retry(id, cause)
+}
+func (s *plainStoreNoStatsProvider) Close() error { return s.base.Close() }
+
+type durableStatusTestStore struct {
+	base     frontier.Store[int]
+	snapshot frontier.DurableStatusSnapshot
+	err      error
+}
+
+func (s *durableStatusTestStore) Enqueue(stage string, item int, hops int) (uint64, error) {
+	return s.base.Enqueue(stage, item, hops)
+}
+func (s *durableStatusTestStore) Reserve(ctx context.Context) (frontier.Entry[int], bool, error) {
+	return s.base.Reserve(ctx)
+}
+func (s *durableStatusTestStore) Ack(id uint64) error { return s.base.Ack(id) }
+func (s *durableStatusTestStore) Retry(id uint64, cause error) error {
+	return s.base.Retry(id, cause)
+}
+func (s *durableStatusTestStore) Close() error { return s.base.Close() }
+func (s *durableStatusTestStore) StatusSnapshot(ctx context.Context) (frontier.DurableStatusSnapshot, error) {
+	if s.err != nil {
+		return frontier.DurableStatusSnapshot{}, s.err
+	}
+	return s.snapshot, nil
 }

@@ -68,6 +68,7 @@ Additional docs:
 - Product direction: `docs/product-plan.md`
 - Architecture boundaries: `docs/architecture.md`
 - Engine-scanner boundary: `docs/boundary.md`
+- Session runtime semantics: `docs/session-runtime.md`
 
 ## Examples
 
