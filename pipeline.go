@@ -39,6 +39,10 @@ func parseStageScope(s DedupScope) (stage string, ok bool) {
 	return "", false
 }
 
+type frontierBlockingEnqueuer[T any] interface {
+	EnqueueWait(ctx context.Context, stage string, item T, hops int) (id uint64, err error)
+}
+
 // Run executes the pipeline with the given seeds. The seeds map specifies the initial input items for each stage. The method returns a map of stage names to their output items, or an error if the pipeline configuration is invalid or if any stage processing fails.
 func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Option[T]) (map[string][]T, error) {
 	runOpts := defaultOptions[T]()
@@ -156,77 +160,23 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 	}
 
 	useFrontier := runOpts.UseFrontier
-	var fs frontier.Store[T]
-	if useFrontier {
-		if runOpts.FrontierStore != nil {
-			fs = runOpts.FrontierStore
-		} else {
-			frontierCap := runOpts.FrontierPendingCap
-			if frontierCap <= 0 {
-				frontierCap = max(1024, runOpts.BufferSize*len(stages))
-			}
-			fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
+	fs, closeFrontierStore, err := setupFrontierRuntime(
+		runCtx,
+		runID,
+		runOpts,
+		len(stages),
+		&frontierStatsWG,
+		&stopFrontierStats,
+		recordErr,
+	)
+	if err != nil {
+		retErr = err
+		return nil, retErr
+	}
+	if closeFrontierStore {
 		defer func() { _ = fs.Close() }()
-		}
-
-		if dfs, ok := fs.(frontier.DurableFrontierStore[T]); ok {
-			const requeueLimit = 4096 // or run option
-			if n, err := dfs.RequeueExpired(runCtx, time.Now(), requeueLimit); err != nil {
-				recordErr(fmt.Errorf("frontier requeue expired: %w", err))
-				if runOpts.FailFast {
-					retErr = err
-					return nil, err
-				}
-			} else if n > 0 {
-				iruntime.Call2(runOpts.Hooks.FrontierRequeueExpired, runCtx, FrontierRequeueExpiredEvent{
-					RunID: runID,
-					Count: n,
-					At:    time.Now(),
-				})
-			}
-		}
-
-		if runOpts.FrontierStatsInterval > 0 {
-			if statsProvider, ok := fs.(frontier.StatsProvider); ok {
-				statsCtx, statsCancel := context.WithCancel(runCtx)
-				stopFrontierStats = statsCancel
-				frontierStatsWG.Go(func() {
-					emit := func() {
-						stats := statsProvider.Stats()
-						iruntime.Call2(runOpts.Hooks.FrontierStats, runCtx, FrontierStatsEvent{
-							RunID:             runID,
-							Pending:           stats.Pending,
-							Inflight:          stats.Inflight,
-							Acked:             stats.Acked,
-							Retried:           stats.Retried,
-							Dropped:           stats.Dropped,
-							TerminalFailed:    stats.TerminalFailed,
-							Canceled:          stats.Canceled,
-							EnqueueFull:       stats.EnqueueFull,
-							PendingQueueDepth: stats.PendingQueueDepth,
-							At:                time.Now(),
-						})
-					}
-
-					emit()
-					ticker := time.NewTicker(runOpts.FrontierStatsInterval)
-					defer ticker.Stop()
-					for {
-						select {
-						case <-statsCtx.Done():
-							return
-						case <-ticker.C:
-							emit()
-						}
-					}
-				})
-			}
-		}
 	}
-	type frontierBlockingEnqueuer interface {
-		EnqueueWait(ctx context.Context, stage string, item T, hops int) (id uint64, err error)
-	}
-	blockingEnqueuer, hasBlockingEnqueuer := fs.(frontierBlockingEnqueuer)
+	blockingEnqueuer, hasBlockingEnqueuer := any(fs).(frontierBlockingEnqueuer[T])
 
 	var enqueueDirect func(stageName string, in T, hops int, frontierEntryID uint64, frontierEntryAttempt int) error
 	var enqueueGuarded func(stageName string, in T, hops int) error
@@ -1173,6 +1123,90 @@ func startStagePools[T any](
 			}
 		}(poolErrCh)
 	}
+}
+
+func setupFrontierRuntime[T any](
+	runCtx context.Context,
+	runID string,
+	runOpts *RunOptions[T],
+	stageCount int,
+	frontierStatsWG *sync.WaitGroup,
+	stopFrontierStats *func(),
+	recordErr func(error),
+) (frontier.Store[T], bool, error) {
+	if !runOpts.UseFrontier {
+		return nil, false, nil
+	}
+
+	var (
+		fs          frontier.Store[T]
+		closeOnExit bool
+	)
+	if runOpts.FrontierStore != nil {
+		fs = runOpts.FrontierStore
+	} else {
+		frontierCap := runOpts.FrontierPendingCap
+		if frontierCap <= 0 {
+			frontierCap = max(1024, runOpts.BufferSize*stageCount)
+		}
+		fs = frontier.NewMemoryStoreWithCapacity[T](frontierCap)
+		closeOnExit = true
+	}
+
+	if dfs, ok := fs.(frontier.DurableFrontierStore[T]); ok {
+		const requeueLimit = 4096 // or run option
+		if n, err := dfs.RequeueExpired(runCtx, time.Now(), requeueLimit); err != nil {
+			recordErr(fmt.Errorf("frontier requeue expired: %w", err))
+			if runOpts.FailFast {
+				return nil, closeOnExit, err
+			}
+		} else if n > 0 {
+			iruntime.Call2(runOpts.Hooks.FrontierRequeueExpired, runCtx, FrontierRequeueExpiredEvent{
+				RunID: runID,
+				Count: n,
+				At:    time.Now(),
+			})
+		}
+	}
+
+	if runOpts.FrontierStatsInterval > 0 {
+		if statsProvider, ok := fs.(frontier.StatsProvider); ok {
+			statsCtx, statsCancel := context.WithCancel(runCtx)
+			*stopFrontierStats = statsCancel
+			frontierStatsWG.Go(func() {
+				emit := func() {
+					stats := statsProvider.Stats()
+					iruntime.Call2(runOpts.Hooks.FrontierStats, runCtx, FrontierStatsEvent{
+						RunID:             runID,
+						Pending:           stats.Pending,
+						Inflight:          stats.Inflight,
+						Acked:             stats.Acked,
+						Retried:           stats.Retried,
+						Dropped:           stats.Dropped,
+						TerminalFailed:    stats.TerminalFailed,
+						Canceled:          stats.Canceled,
+						EnqueueFull:       stats.EnqueueFull,
+						PendingQueueDepth: stats.PendingQueueDepth,
+						At:                time.Now(),
+					})
+				}
+
+				emit()
+				ticker := time.NewTicker(runOpts.FrontierStatsInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-statsCtx.Done():
+						return
+					case <-ticker.C:
+						emit()
+					}
+				}
+			})
+		}
+	}
+
+	return fs, closeOnExit, nil
 }
 
 func (p *Pipeline[T]) validateSnapshot(stages map[string]Stage[T], edges map[string][]string, allowCycles bool) error {
