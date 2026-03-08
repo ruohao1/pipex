@@ -198,20 +198,13 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 			seenMu.Unlock()
 		}
 
-		if dedupRules, ok := dedupRulesByStage[stageName]; ok {
-			for _, rule := range dedupRules {
-				dedupKeyValue, derr := func() (key string, err error) {
-					defer func() {
-						if r := recover(); r != nil {
-							err = fmt.Errorf("dedup key panic: %v", r)
-						}
-					}()
-					return rule.Key(in), nil
-				}()
-				if derr != nil {
-					rollbackDedup()
-					return derr
-				}
+			if dedupRules, ok := dedupRulesByStage[stageName]; ok {
+				for _, rule := range dedupRules {
+					dedupKeyValue, derr := iruntime.SafeStringKey(rule.Key, in)
+					if derr != nil {
+						rollbackDedup()
+						return derr
+					}
 				key = stageName + "\x00" + dedupKeyValue
 				dedupMapKey := stageName + "\x00" + rule.Name + "\x00" + dedupKeyValue
 				seenMu.Lock()
