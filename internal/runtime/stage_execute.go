@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -19,13 +20,15 @@ type StageExecutionResult[T any] struct {
 }
 
 type StageExecutionConfig[T any] struct {
-	Ctx          context.Context
-	Stage        string
-	Input        T
-	Policy       StageExecutionPolicy
-	Process      func(context.Context, T) ([]T, error)
-	IsContextErr func(error) bool
-	WaitRate     func(context.Context) error
+	Ctx           context.Context
+	Stage         string
+	Input         T
+	Policy        StageExecutionPolicy
+	Process       func(context.Context, T) ([]T, error)
+	ProcessStream func(context.Context, T, func(T) error) error
+	Emit          func(T) error
+	IsContextErr  func(error) bool
+	WaitRate      func(context.Context) error
 
 	OnStageStart   func(startedAt time.Time)
 	OnStageFinish  func(outCount int, startedAt, finishedAt time.Time)
@@ -72,13 +75,49 @@ func ExecuteStageWithPolicy[T any](cfg StageExecutionConfig[T]) StageExecutionRe
 		if cfg.OnAttemptStart != nil {
 			cfg.OnAttemptStart(attempt, attemptStart)
 		}
-		out, err = cfg.Process(attemptCtx, cfg.Input)
+		emittedCount := 0
+		if cfg.ProcessStream != nil {
+			err = cfg.ProcessStream(attemptCtx, cfg.Input, func(item T) error {
+				if cfg.Emit != nil {
+					if emitErr := cfg.Emit(item); emitErr != nil {
+						return emitErr
+					}
+				}
+				emittedCount++
+				return nil
+			})
+			out = nil
+		} else {
+			if cfg.Process == nil {
+				err = fmt.Errorf("stage %s: no process function", cfg.Stage)
+				attemptFinish := time.Now()
+				cancel()
+				if cfg.OnAttemptError != nil {
+					cfg.OnAttemptError(attempt, attemptStart, attemptFinish, err)
+				}
+				if cfg.OnExhausted != nil {
+					cfg.OnExhausted(attempt, err, attemptFinish)
+				}
+				if cfg.OnStageError != nil {
+					cfg.OnStageError(stageStart, attemptFinish, err)
+				}
+				return StageExecutionResult[T]{
+					Err:        err,
+					AckOnError: true,
+				}
+			}
+			out, err = cfg.Process(attemptCtx, cfg.Input)
+		}
 		attemptFinish := time.Now()
 		cancel()
 
 		if err == nil {
 			if cfg.OnStageFinish != nil {
-				cfg.OnStageFinish(len(out), stageStart, attemptFinish)
+				outCount := len(out)
+				if cfg.ProcessStream != nil {
+					outCount = emittedCount
+				}
+				cfg.OnStageFinish(outCount, stageStart, attemptFinish)
 			}
 			return StageExecutionResult[T]{
 				Out:        out,

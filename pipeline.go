@@ -296,20 +296,56 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 						}
 
 						stageDef := stages[stage]
+						streamingStage, isStreaming := stageDef.(StreamingStage[T])
 						policy, hasPolicy := runOpts.StagePolicies[stage]
 						if !hasPolicy {
 							policy = StagePolicy{MaxAttempts: 1}
 						}
 
+						emitOutput := func(item T) error {
+							resultsMu.Lock()
+							results[stage] = append(results[stage], item)
+							resultsMu.Unlock()
+
+							for _, sinkCh := range sinksByStage[stage] {
+								select {
+								case <-runCtx.Done():
+									return runCtx.Err()
+								case sinkCh <- item:
+								}
+							}
+
+							for _, nextStage := range edges[stage] {
+								if err := enqueueGuarded(nextStage, item, hops+1); err != nil {
+									return fmt.Errorf("enqueue to %s: %w", nextStage, err)
+								}
+							}
+
+							return nil
+						}
+
+						process := func(attemptCtx context.Context, item T) ([]T, error) {
+							return stageDef.Process(attemptCtx, item)
+						}
+						var processStream func(context.Context, T, func(T) error) error
+						var emit func(T) error
+						if isStreaming {
+							process = nil
+							processStream = func(attemptCtx context.Context, item T, attemptEmit func(T) error) error {
+								return streamingStage.ProcessStream(attemptCtx, item, attemptEmit)
+							}
+							emit = emitOutput
+						}
+
 						execResult := iruntime.ExecuteStageWithPolicy(iruntime.StageExecutionConfig[T]{
-							Ctx:    runCtx,
-							Stage:  stage,
-							Input:  in,
-							Policy: iruntime.StageExecutionPolicy{MaxAttempts: policy.MaxAttempts, Backoff: policy.Backoff, Timeout: policy.Timeout},
-							Process: func(attemptCtx context.Context, item T) ([]T, error) {
-								return stageDef.Process(attemptCtx, item)
-							},
-							IsContextErr: isContextErr,
+							Ctx:           runCtx,
+							Stage:         stage,
+							Input:         in,
+							Policy:        iruntime.StageExecutionPolicy{MaxAttempts: policy.MaxAttempts, Backoff: policy.Backoff, Timeout: policy.Timeout},
+							Process:       process,
+							ProcessStream: processStream,
+							Emit:          emit,
+							IsContextErr:  isContextErr,
 							WaitRate: func(waitCtx context.Context) error {
 								if limiter, ok := limiters[stage]; ok {
 									if err := limiter.Wait(waitCtx); err != nil {
@@ -425,26 +461,10 @@ func (p *Pipeline[T]) Run(ctx context.Context, seeds map[string][]T, opts ...Opt
 							}
 							return fmt.Errorf("stage %s: %w", stage, err)
 						}
-						out := execResult.Out
-
-						resultsMu.Lock()
-						results[stage] = append(results[stage], out...)
-						resultsMu.Unlock()
-
-						for _, item := range out {
-							for _, sinkCh := range sinksByStage[stage] {
-								select {
-								case <-runCtx.Done():
-									return runCtx.Err()
-								case sinkCh <- item:
-								}
-							}
-						}
-
-						for _, nextStage := range edges[stage] {
-							for _, item := range out {
-								if err := enqueueGuarded(nextStage, item, hops+1); err != nil {
-									return fmt.Errorf("enqueue to %s: %w", nextStage, err)
+						if !isStreaming {
+							for _, item := range execResult.Out {
+								if err := emitOutput(item); err != nil {
+									return err
 								}
 							}
 						}

@@ -57,6 +57,7 @@ go run ./examples/quickstart
 - Sinks and sink retry: `docs/sinks.md`
 - Hooks and observability: `docs/hooks.md`
 - Stage workers: `docs/stage-workers.md`
+- Streaming stages: `docs/streaming-stages.md`
 - Stage rate limits: `docs/rate-limits.md`
 - Stage retry/timeout policies: documented in API and tests
 - Dedup rules: `docs/dedup.md`
@@ -75,3 +76,4 @@ Additional docs:
 - Quickstart: `go run ./examples/quickstart`
 - Sink integration: `go run ./examples/sink`
 - Cycle mode: `go run ./examples/cycle`
+- Streaming stages: `go run ./examples/streaming`

@@ -30,6 +30,31 @@ func (s testStage[T]) Process(ctx context.Context, in T) (out []T, err error) {
 	return []T{in}, nil
 }
 
+type testStreamingStage[T any] struct {
+	name      string
+	workers   int
+	processFn func(context.Context, T) ([]T, error)
+	streamFn  func(context.Context, T, func(T) error) error
+}
+
+func (s testStreamingStage[T]) Name() string { return s.name }
+
+func (s testStreamingStage[T]) Workers() int { return s.workers }
+
+func (s testStreamingStage[T]) Process(ctx context.Context, in T) (out []T, err error) {
+	if s.processFn != nil {
+		return s.processFn(ctx, in)
+	}
+	return nil, errors.New("test streaming stage: Process should not be used")
+}
+
+func (s testStreamingStage[T]) ProcessStream(ctx context.Context, in T, emit func(T) error) error {
+	if s.streamFn != nil {
+		return s.streamFn(ctx, in, emit)
+	}
+	return nil
+}
+
 type mutableWorkersStage[T any] struct {
 	name string
 	w    atomic.Int64
@@ -218,6 +243,181 @@ func TestRunLinearFlow(t *testing.T) {
 	}
 	if got := res["b"]; len(got) != 1 || got[0] != 4 {
 		t.Fatalf("unexpected stage b outputs: %v", got)
+	}
+}
+
+func TestRunStreamingStageEmitsDownstreamBeforeReturn(t *testing.T) {
+	p := NewPipeline[int]()
+	allowReturn := make(chan struct{})
+	downstreamProcessed := make(chan int, 1)
+
+	_ = p.AddStage(testStreamingStage[int]{
+		name:    "discover",
+		workers: 1,
+		streamFn: func(ctx context.Context, in int, emit func(int) error) error {
+			if err := emit(in + 1); err != nil {
+				return err
+			}
+			<-allowReturn
+			return nil
+		},
+	})
+	_ = p.AddStage(testStage[int]{
+		name:    "scan",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			downstreamProcessed <- in
+			return []int{in * 10}, nil
+		},
+	})
+	_ = p.Connect("discover", "scan")
+
+	type runResult struct {
+		res map[string][]int
+		err error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		res, err := p.Run(context.Background(), map[string][]int{"discover": {1}})
+		done <- runResult{res: res, err: err}
+	}()
+
+	select {
+	case got := <-downstreamProcessed:
+		if got != 2 {
+			t.Fatalf("unexpected downstream input: got %d want %d", got, 2)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for downstream processing before streaming stage return")
+	}
+
+	close(allowReturn)
+
+	select {
+	case rr := <-done:
+		if rr.err != nil {
+			t.Fatalf("unexpected run error: %v", rr.err)
+		}
+		if got := rr.res["discover"]; len(got) != 1 || got[0] != 2 {
+			t.Fatalf("unexpected discover outputs: %v", got)
+		}
+		if got := rr.res["scan"]; len(got) != 1 || got[0] != 20 {
+			t.Fatalf("unexpected scan outputs: %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not complete")
+	}
+}
+
+func TestRunStreamingStageRetryIsAtLeastOnce(t *testing.T) {
+	p := NewPipeline[int]()
+	var attempts atomic.Int64
+
+	_ = p.AddStage(testStreamingStage[int]{
+		name:    "discover",
+		workers: 1,
+		streamFn: func(ctx context.Context, in int, emit func(int) error) error {
+			if err := emit(in + 1); err != nil {
+				return err
+			}
+			if attempts.Add(1) == 1 {
+				return errors.New("transient")
+			}
+			return nil
+		},
+	})
+	_ = p.AddStage(testStage[int]{
+		name:    "scan",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			return []int{in * 10}, nil
+		},
+	})
+	_ = p.Connect("discover", "scan")
+
+	res, err := p.Run(
+		context.Background(),
+		map[string][]int{"discover": {1}},
+		WithStagePolicies[int](map[string]StagePolicy{
+			"discover": {MaxAttempts: 2},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	if got := res["discover"]; len(got) != 2 {
+		t.Fatalf("unexpected discover outputs len: got %d want %d outputs=%v", len(got), 2, got)
+	}
+	if got := res["scan"]; len(got) != 2 {
+		t.Fatalf("unexpected scan outputs len: got %d want %d outputs=%v", len(got), 2, got)
+	}
+}
+
+func TestRunStreamingStageEmitsDownstreamBeforeReturnWithFrontier(t *testing.T) {
+	p := NewPipeline[int]()
+	allowReturn := make(chan struct{})
+	downstreamProcessed := make(chan int, 1)
+
+	_ = p.AddStage(testStreamingStage[int]{
+		name:    "discover",
+		workers: 1,
+		streamFn: func(ctx context.Context, in int, emit func(int) error) error {
+			if err := emit(in + 1); err != nil {
+				return err
+			}
+			<-allowReturn
+			return nil
+		},
+	})
+	_ = p.AddStage(testStage[int]{
+		name:    "scan",
+		workers: 1,
+		fn: func(ctx context.Context, in int) ([]int, error) {
+			downstreamProcessed <- in
+			return []int{in * 10}, nil
+		},
+	})
+	_ = p.Connect("discover", "scan")
+
+	type runResult struct {
+		res map[string][]int
+		err error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		res, err := p.Run(
+			context.Background(),
+			map[string][]int{"discover": {1}},
+			WithFrontier[int](true),
+		)
+		done <- runResult{res: res, err: err}
+	}()
+
+	select {
+	case got := <-downstreamProcessed:
+		if got != 2 {
+			t.Fatalf("unexpected downstream input: got %d want %d", got, 2)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for downstream processing before streaming stage return")
+	}
+
+	close(allowReturn)
+
+	select {
+	case rr := <-done:
+		if rr.err != nil {
+			t.Fatalf("unexpected run error: %v", rr.err)
+		}
+		if got := rr.res["discover"]; len(got) != 1 || got[0] != 2 {
+			t.Fatalf("unexpected discover outputs: %v", got)
+		}
+		if got := rr.res["scan"]; len(got) != 1 || got[0] != 20 {
+			t.Fatalf("unexpected scan outputs: %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not complete")
 	}
 }
 
